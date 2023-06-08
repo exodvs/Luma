@@ -913,14 +913,15 @@ func printTime(t int64){
 /*Creates an image whose brightness is based on the result of a luma trace and
 whose color is based on the original image*/
 func colorize (img image.Image, array1 [][]uint8, array2 [][]uint8, w int, h int) image.Image{
+	imgType := strings.ToLower(reflect.TypeOf(img).String())
 	/*This process is automatically called in the main method, whatever befall,
 	so this statement is for if the intent never was to perform a luma trace
 	on a color image.*/
-	if strings.HasSuffix(strings.ToLower(reflect.TypeOf(img).String()), "gray"){
+	if strings.HasSuffix(imgType, "gray"){
 		return img
 	}
 	/*Currently, only monochrome and RGBA images are supported.*/
-	if strings.HasSuffix(strings.ToLower(reflect.TypeOf(img).String()), "rgba"){
+	if strings.HasSuffix(imgType, "rgba") || strings.HasSuffix(imgType, "paletted"){
 		tp := uint8(16)
 		ymg := image.NewRGBA(image.Rectangle{image.Point{0,0}, image.Point{w,h}})
 		for x := 0; x < w; x++{
