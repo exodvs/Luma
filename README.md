@@ -16,6 +16,7 @@ Download and run using your favorite Go tools.
 
 	go run ./Luma.go -i image.png 4 10 0.05
 
+
 	The above command takes the data from image.png and requires data fragments to be at least 5% different from each other in order to remain.
 
 
@@ -41,7 +42,7 @@ I tried various noise filters, line-squiggle effects, coloration tricks, and eve
 
 Since the look is achieved by small irregularities in the linework and filmgrain, it seemed that the solution was to show the computer various examples of how these details should appear. The primary purpose of this program is to take one or more image (in its intended case, stillframes from hand-drawn animation) and break it apart into fragments, and to take another image (in its intended case, frames of digitally-produced animation) and break it into fragments as well, and find the closest fragments in the first set, transplanting them into an alternate version of the second image. In theory, the result will appear as old-fashioned frames of animation.
 
-The first step of this process involved deciding what kind of data structures would be required. I found the easiest way to randomly split apart an image such that each and every one of its pixels would be included in a strict rectangle (i.e. no l-shaped regions) was a tree with x and y coordinates, and a minimum and maximum size. As for the image fragments themselves, the grid structure was a very early idea, and appeared in its early development mostly resembling its current form, with the array and the dimensions.
+The first step of this process involved deciding what kind of data structures would be required. I found the easiest way to randomly split apart an image such that each and every one of its pixels would be included in a strict rectangle (i.e. no l-shaped regions) was a tree with x and y coordinates, and a minimum and maximum size. As for the image fragments themselves, the grid structure was a very early idea, and appeared in the early development of Luma mostly resembling its current form, with the array and the dimensions.
 
 At first, I simply developed code until I could get an image subdivided correctly by the tree, and use this tree to create grids. The next step was to sort the grids. Early on, I decided that the primary means of sorting grids would be by dimensions. However, searches would still take a long time, such that it would take several minutes to process one image. In order to reduce search size, I added a margin variable to various methods. The user is allowed to decided how different each grid has to be from other grids produced by the program. This helped somewhat, but images still took several minutes to process, and had a mottled, blotched look.
 
@@ -52,9 +53,9 @@ Early development of this program took place in Python, as that could be develop
 
 The process for searching for possible redundant arrays and for possible matches were two bottlenecks even in Go, and blotching still plagued the output images in tests. An earlier version of the code simply found the most similar grid from a base image as the grid was created. I had to rewrite the program so that an image's grids were stored, sorted, and then compared to the existing array. This involved the creation of a map that also stored coordinates, and the most immediate advantage was that instead of doing a binary search over the entire array each time, the program would have endpoints of the array that encompassed all other grids of the same dimension to the one under examination. Once no more grids with those same dimensions were being examined, the program would look elsewhere, stay in the new section as long as it needed to, and so on. My tests involved grids between 4 and 10 pixels in either axis, inclusive, meaning that only 49 binary searches were needed instead of the tens of thousands needed previously.
 
-During previous testing, the program's method for adding new girds to the set of hand-drawn data and the method used to eliminate redundant grids involved a grid-by-grid addition to a list (in Python) or slice (in Go). This itself was taking considerable time, so I rewrote the program to simply add each grid as it came, sort them, and then eliminate before adding to an array of a predefined size. To determine which would stay and which would be discarded, the program uses an array of unsigned integers that are altered through bitwise operations. The set bits are used to indicate those which will remain.
+During previous testing, the program's method for adding new grids to the set of hand-drawn data and the method used to eliminate redundant grids involved a grid-by-grid addition to a list (in Python) or slice (in Go). This itself was taking considerable time, so I rewrote the program to simply add each grid as it came, sort them, and then eliminate before adding to an array of a predefined size. To determine which would stay and which would be discarded, the program uses an array of unsigned integers that are altered through bitwise operations. The set bits are used to indicate those which will remain.
 
-Finally, the blotching problem was solved mostly by requiring the corners of two grids be similar in brightness before eliminating one of them.
+Finally, the blotching problem was solved mostly by requiring the corners of two grids to be similar in brightness before eliminating one of them.
 
 It currently takes less than a second to trace over a 1080p image, against an array of over 400000 grids. Actually producing this array takes considerable time, but it is not something that can be easily sped up. There is simply no way to save most of several dozen images that takes less than several seconds.
 

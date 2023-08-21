@@ -917,12 +917,23 @@ func colorize (img image.Image, array1 [][]uint8, array2 [][]uint8, w int, h int
 	/*This process is automatically called in the main method, whatever befall,
 	so this statement is for if the intent never was to perform a luma trace
 	on a color image.*/
+	tp := uint8(16)
 	if strings.HasSuffix(imgType, "gray"){
-		return img
+		ymg := image.NewGray(image.Rectangle{image.Point{0,0}, image.Point{w,h}})
+		for x := 0; x < w; x++{
+			for y := 0; y < h; y++{
+				ln := array2[x][y]
+				gray := array1[x][y]
+				for byteAbsDiff(ln, gray) > tp{
+					ln = (ln>>1)+(gray>>1)+(1&ln&gray)
+				}
+				ymg.SetGray(x, y, color.Gray{ln})
+			}
+		}
+		return ymg
 	}
 	/*Currently, only monochrome and RGBA images are supported.*/
 	if strings.HasSuffix(imgType, "rgba") || strings.HasSuffix(imgType, "paletted"){
-		tp := uint8(16)
 		ymg := image.NewRGBA(image.Rectangle{image.Point{0,0}, image.Point{w,h}})
 		for x := 0; x < w; x++{
 			for y := 0; y < h; y++{
