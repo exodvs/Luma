@@ -300,7 +300,7 @@ func gridDiffMax(g1 Grid, g2 Grid, maxIn uint8) uint8 {
 This finds the total difference between two grids, but will return early
 under certain conditions.
 */
-func gridDiffAlt(g1 Grid, g2 Grid, maxDiff uint8, crossRange uint8) uint32 {
+func gridDiffFast(g1 Grid, g2 Grid, maxDiff uint8, crossRange uint8) uint32 {
 	if g1.w != g2.w || g1.h != g2.h {
 		return math.MaxUint32
 	}
@@ -327,6 +327,33 @@ func gridDiffAlt(g1 Grid, g2 Grid, maxDiff uint8, crossRange uint8) uint32 {
 	}
 	if i < area && sum < maxSum {
 		return sum + ((area - i) * cr32)
+	}
+	return sum
+}
+
+func gridDiffAlt(g1 Grid, g2 Grid, maxDiff uint8) uint32 {
+	if g1.w != g2.w || g1.h != g2.h {
+		return math.MaxUint32
+	}
+	/*Obviously, if the lowest of one grid is maxDiff above the maximum of the other grid,
+	then all corresponding pixels have a difference greater than or equal to maxDiff.*/
+	if (g2.maxLuma < 255-maxDiff && g1.minLuma > g2.maxLuma+maxDiff) || (g1.maxLuma < 255-maxDiff && g2.minLuma > g1.maxLuma+maxDiff) {
+		return math.MaxUint32
+	}
+	sum := uint32(0)
+	h32 := uint32(g1.h)
+	area := uint32(g1.w) * h32
+	maxSum := uint32(maxDiff) * uint32(g1.w) * uint32(g1.h)
+	var pixel1, pixel2 uint8
+	i := uint32(0)
+	/*The third condition determines if there is still a mathematic possibility for the
+	sum to exceed the maximum designated sum. Maintaining this loop to the end indeed
+	is a tightrope balance, but adding this third condition solved a slowdown issue.*/
+	for i < area && sum < maxSum {
+		pixel1 = g1.array[i/h32][i%h32]
+		pixel2 = g2.array[i/h32][i%h32]
+		sum += uint32(byteAbsDiff(pixel1, pixel2))
+		i++
 	}
 	return sum
 }
@@ -500,7 +527,7 @@ func compareGridBoolSingle(array []Grid, margin float64, cursor uint32, octet ui
 						two justifications for elimination: if the ranges are small and the overall difference
 						is small; or if the ranges are large, while the largest difference between any
 						corresponding pixels is still small.*/
-						if crossRange < margInt || (maxCornerDiff(a1, a2, margInt) < margInt && ((range1 < margInt && gridDiffAlt(a1, a2, margInt, crossRange) < uint32(margInt)*area) || (range1 >= margInt && gridDiffMax(a1, a2, margInt) < margInt))) {
+						if crossRange < margInt || (maxCornerDiff(a1, a2, margInt) < margInt && ((range1 < margInt && gridDiffFast(a1, a2, margInt, crossRange) < uint32(margInt)*area) || (range1 >= margInt && gridDiffMax(a1, a2, margInt) < margInt))) {
 							if rand.Uint32()%2 == 0 {
 								octet &= (^(1 << uint8(w1)))
 							} else {
@@ -592,7 +619,7 @@ func compareGridBool(array []Grid, margin float64, cursor1 uint32, cursor2 uint3
 							byteAbsDiff(corner2, a2.array[0][a1.h-1]) < margChar &&
 							byteAbsDiff(corner3, a2.array[a1.w-1][0]) < margChar &&
 							byteAbsDiff(corner4, a2.array[a1.w-1][a1.h-1]) < margChar &&
-							((range1 < margChar && gridDiffAlt(a1, a2, margChar, crossRange) < uint32(margChar)*uint32(a1.w)*uint32(a1.h)) || (range1 >= margChar && gridDiffMax(a1, a2, margChar) < margChar))) {
+							((range1 < margChar && gridDiffFast(a1, a2, margChar, crossRange) < uint32(margChar)*uint32(a1.w)*uint32(a1.h)) || (range1 >= margChar && gridDiffMax(a1, a2, margChar) < margChar))) {
 							if rand.Uint32()%2 != 0 {
 								bool1 &= (^(1 << uint8(i)))
 							} else {
@@ -1013,7 +1040,6 @@ func gridsFromCoords(img [][][]uint8, trees []*Tree) []Grid {
 	for i := 0; i < len(trees); i++ {
 		coordsFromTree(trees[i], coordArray, tempLeafNum)
 		l := uint32(trees[i].leafNum)
-		//sort.Slice(coordArray, func(i, j int) bool { return j < int(tempLeafNum) || i >= int(tempLeafNum+l) || coordArray[j][1]-coordArray[j][0] > coordArray[i][1]-coordArray[i][0] || (coordArray[j][1]-coordArray[j][0] == coordArray[i][1]-coordArray[i][0] && coordArray[j][3]-coordArray[j][2] > coordArray[i][3]-coordArray[i][2])})
 		tempLeafNum += l
 	}
 
@@ -1143,6 +1169,9 @@ func lumaTrace(img [][]uint8, ymg [][]uint8, array []Grid, arrayLen uint32, t *T
 			h2 = firstCursor(array, g, 3, h1, h_b)
 			a = firstCursor(array, g, 5, h1, h2)
 		}
+		if a >= arrayLen {
+			a = arrayLen - 1
+		}
 		minDiffC := a
 		minDiffInt := uint8(gridDiff(array[a], g) / (uint32(g.w) * uint32(g.h)))
 		/*The program guesses based on previous information and restricts
@@ -1176,18 +1205,51 @@ func lumaTrace(img [][]uint8, ymg [][]uint8, array []Grid, arrayLen uint32, t *T
 			}
 			l2 = n2
 		}
-		wg.Add(int(tNum))
+		if l2 >= arrayLen {
+			l2 = arrayLen - 1
+		}
+		for k := int(a); k >= int(l1) && k >= 0; k-- {
+			if byteAbsDiff(g.avgLuma, array[k].avgLuma) < minDiffInt && (g.maxLuma > 255-minDiffInt || array[k].minLuma < g.maxLuma+minDiffInt) && (array[k].maxLuma > 255-minDiffInt || g.minLuma < array[k].maxLuma+minDiffInt) {
+				crossRange := getCrossRange(array[k], g)
+				var diffTemp uint32
+				if crossRange >= minDiffInt {
+					diffTemp = gridDiffAlt(array[k], g, minDiffInt)
+				} else {
+					diffTemp = uint32(crossRange) * uint32(g.w) * uint32(g.h)
+				}
+				if diffTemp < uint32(minDiffInt)*uint32(g.w)*uint32(g.h) {
+					minDiffInt = uint8(diffTemp / (uint32(g.w) * uint32(g.h)))
+					minDiffC = uint32(k)
+				}
+			}
+		}
+		for k := a + 1; k < l2; k++ {
+			if byteAbsDiff(g.avgLuma, array[k].avgLuma) < minDiffInt && (g.maxLuma > 255-minDiffInt || array[k].minLuma < g.maxLuma+minDiffInt) && (array[k].maxLuma > 255-minDiffInt || g.minLuma < array[k].maxLuma+minDiffInt) {
+				crossRange := getCrossRange(array[k], g)
+				var diffTemp uint32
+				if crossRange >= minDiffInt {
+					diffTemp = gridDiffAlt(array[k], g, minDiffInt)
+				} else {
+					diffTemp = uint32(crossRange) * uint32(g.w) * uint32(g.h)
+				}
+				if diffTemp < uint32(minDiffInt)*uint32(g.w)*uint32(g.h) {
+					minDiffInt = uint8(diffTemp / (uint32(g.w) * uint32(g.h)))
+					minDiffC = k
+				}
+			}
+		}
+		/*wg.Add(int(tNum))
 		for k := uint32(0); k < tNum; k++ {
 			go func(k uint32) {
-				defer wg.Done()
-				/*Each core will cover a different segment of the array before and after the initial guess.
-				If there is no mathematical way for even the beginning of the segment in question to be
-				more similar to the grid in the map vis a vis the most similar thus far found, the for loop
-				below simply doesn't start. If it might be, it looks at each grid in the segment, and only
-				when demonstrating there is mathematically enough similarity to the grid in the map to
-				warrant a comparison, checks to see if the grid is more similar. These levels of gatekeeping
-				solved a bottleneck that previously caused an image to take minutes to trace.*/
-				loopStart := a + (k * (l2 - a) / tNum) + 1
+				defer wg.Done()*/
+		/*Each core will cover a different segment of the array before and after the initial guess.
+		If there is no mathematical way for even the beginning of the segment in question to be
+		more similar to the grid in the map vis a vis the most similar thus far found, the for loop
+		below simply doesn't start. If it might be, it looks at each grid in the segment, and only
+		when demonstrating there is mathematically enough similarity to the grid in the map to
+		warrant a comparison, checks to see if the grid is more similar. These levels of gatekeeping
+		solved a bottleneck that previously caused an image to take minutes to trace.*/
+		/*loopStart := a + (k * (l2 - a) / tNum) + 1
 				loopEnd := a + (((k + 1) * (l2 - a)) / tNum) - ((k + 1) / tNum)
 				for j := loopStart; j <= loopEnd; j++ {
 					if byteAbsDiff(g.avgLuma, array[j].avgLuma) < minDiffInt && (g.maxLuma > 255-minDiffInt || array[j].minLuma < g.maxLuma+minDiffInt) && (array[j].maxLuma > 255-minDiffInt || g.minLuma < array[j].maxLuma+minDiffInt) {
@@ -1201,7 +1263,6 @@ func lumaTrace(img [][]uint8, ymg [][]uint8, array []Grid, arrayLen uint32, t *T
 						if diffTemp < uint32(minDiffInt)*uint32(g.w)*uint32(g.h) {
 							minDiffInt = uint8(diffTemp / (uint32(g.w) * uint32(g.h)))
 							minDiffC = j
-							//minDiffInt = uint8(minDiff*256.0)
 						}
 					}
 				}
@@ -1219,13 +1280,12 @@ func lumaTrace(img [][]uint8, ymg [][]uint8, array []Grid, arrayLen uint32, t *T
 						if diffTemp < uint32(minDiffInt)*uint32(g.w)*uint32(g.h) {
 							minDiffInt = uint8(diffTemp / (uint32(g.w) * uint32(g.h)))
 							minDiffC = j
-							//minDiffInt = uint8(minDiff*256.0)
 						}
 					}
 				}
 			}(k)
 		}
-		wg.Wait()
+		wg.Wait()*/
 		/*The coordinates are stored in the map, in a way involving bitwise operations. This simply
 		reverses those operations to get separate x and y values.*/
 		x1 := keys[i] >> 16
@@ -1308,7 +1368,6 @@ func readFromFile(fName string) ([]Grid, error) {
 				}
 			}
 			g.avgLuma = uint8(sum / (uint32(w) * uint32(h)))
-			//g.resetLuma()
 			array[i] = g
 		} else {
 			panic("Empty grid found while reading from file")
@@ -1593,7 +1652,6 @@ func main() {
 			fmt.Println("	-k	Save a dataset")
 			fmt.Println("e.g.	(-i or -l option) -k newDataSet")
 			fmt.Println("	-t	Set number of threads, default 1.")
-			fmt.Println("	-x	Output to standard output, to use the input with other prorams. Cannot be used with -y or -k, and must have -i or -l specify input data.")
 			fmt.Println("The original purpose of this program was to make digitally-created images appear hand-drawn. However, it can be used for texturing of any kind.")
 			return
 		} else if args[i] == "-t" {
@@ -1612,7 +1670,7 @@ func main() {
 		if len(lArray) == 0 && len(iArray) == 0 && len(yArray) == 0 {
 			fmt.Println("See list of options with -h.")
 		} else {
-			fmt.Println("Insufficient arguments, please specify either an output image using -o, an output dataset using -k, or print to standard output with -x")
+			fmt.Println("Insufficient arguments, please specify either an output image using -o or an output dataset using -k")
 		}
 		return
 	}
@@ -1620,7 +1678,7 @@ func main() {
 		fmt.Println("Output dataset specified without specifying input image using -i or input dataset using -l")
 		return
 	}
-	if len(oArray) > 0 && (len(yArray) == 0 || len(lArray) == 0 || len(iArray) == 0) {
+	if len(oArray) > 0 && (len(yArray) == 0 || (len(lArray) == 0 && len(iArray) == 0)) {
 		fmt.Println("Output image specified without base image specified by -y or input image specified with -i or input dataset specified with -l")
 		return
 	}
@@ -1633,7 +1691,7 @@ func main() {
 		return
 	}
 	if len(yArray) > 0 && len(oArray) == 0 {
-		fmt.Println("Base image specified without output image specified with -o or standard output with -x")
+		fmt.Println("Base image specified without output image specified with -o")
 		return
 	}
 	if len(kArray) > 1 {
@@ -1783,7 +1841,6 @@ func main() {
 		sort.Slice(array, func(i, j int) bool { return lessGrid(array[i], array[j], false) })
 		fmt.Printf("Sorting completed\n")
 		if margin > 0 {
-			//origSize := len(array);
 			fmt.Println("Removing redundant grids")
 			start = time.Now().UnixNano()
 			array = removeRedundantGrids(array, margin, tNum)
@@ -1799,16 +1856,7 @@ func main() {
 				}
 			}
 			arrayLen = n1
-			/*end := time.Now().UnixNano()
-			fmt.Println("Go reduction: ")
-			printTime(end-start)
-			cArray := cGridArray(array)
-			start = time.Now().UnixNano()
-			cArray = C.reducedArray(cArray, C.uint(len(array)), C.float(margin))*/
 			end := time.Now().UnixNano()
-			/*C.freeGridArray(cArray, C.gridArraySize(cArray, C.ulong(0), C.ulong(origSize)));
-			fmt.Println("C reduction: ")
-			printTime(end-start)*/
 			timeTotal := (end - startTemp)
 			printTime(timeTotal)
 		}
