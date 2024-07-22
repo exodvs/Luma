@@ -644,114 +644,7 @@ func lastSet(octet uint8, u uint8) uint8 {
 func compareDoubles(boolArray []uint8, a uint32, b uint32, array []Grid, u1 uint32, v1 uint32, margin float64, tNum uint32) {
 	margChar := uint8(margin * 256.0)
 	gv := array[(a<<3)+(v1-1)]
-	remOct := b - (a + 1)
-	modT := uint32(0)
-	tNumAct := tNum
-	octPer := uint32(1)
-	if remOct > tNum {
-		modT = remOct % tNum
-		octPer = remOct / tNum
-	} else if remOct < tNum {
-		tNumAct = remOct
-	}
-	wg.Add(int(tNumAct))
-	for t := uint32(0); boolArray[a] != 0 && t < tNumAct; t++ {
-		go func(t uint32) {
-			defer wg.Done()
-			for k := uint32(0); boolArray[a] != 0 && k < octPer; k++ {
-				if boolArray[(t*octPer)+k+a+1] != 0 {
-					ii := (t * octPer) + k + a + 1
-					u2 := uint32(firstSet(boolArray[ii]))
-					for u2 > 0 && (ii<<3)+u2 >= uint32(len(array)) {
-						u2--
-					}
-					for u2 > 0 && (boolArray[ii]>>uint8(u1))%2 == 0 {
-						u2--
-					}
-					if array[(ii<<3)+u2].h == gv.h && array[(ii<<3)+u2].w == gv.w && array[(ii<<3)+u2].avgLuma-gv.avgLuma < margChar {
-						v2 := u2 + 1
-						for v2 < 8 && boolArray[ii]>>uint8(v2) == 1 && array[(ii<<3)+v2].h == gv.h && array[(ii<<3)+v2].w == gv.w {
-							v2++
-						}
-						doublet := compareGridBool(array, margin, a, ii, boolArray[a], boolArray[ii], u1, v2, u2, v2)
-						newA := uint8(doublet % 256)
-						/*If the first octet has changed, make the necessary adjustments*/
-						if newA != boolArray[a] {
-							if newA != 0 {
-								u1 := uint32(firstSet(newA))
-								for u1 > 0 && (a<<3)+u1 >= uint32(len(array)) {
-									u1--
-								}
-								for u1 > 0 && (newA>>uint8(u1))%2 == 0 {
-									u1--
-								}
-								v1 = uint32(lastSet(newA, uint8(u1)+1))
-								for v1 > u1 && (a<<3)+(v1-1) >= uint32(len(array)) {
-									v1--
-								}
-								for v1 > u1 && (newA>>uint8(v1-1))%2 == 0 {
-									v1--
-								}
-								gv = array[(a<<3)+(v1-1)]
-							}
-							boolArray[a] = newA
-						}
-						boolArray[ii] = uint8(doublet >> 8)
-					}
-				}
-			}
-		}(t)
-	}
-	wg.Wait()
-	if modT > 0 && boolArray[a] != 0 {
-		wg.Add(int(modT))
-		for t := b - modT; boolArray[a] != 0 && t < b; t++ {
-			go func(t uint32) {
-				defer wg.Done()
-				if t < uint32(len(boolArray)) && boolArray[t] != 0 {
-					u2 := uint32(firstSet(boolArray[t]))
-					for u2 > 0 && (t<<3)+u2 >= uint32(len(array)) {
-						u2--
-					}
-					for u2 > 0 && (boolArray[t]>>uint8(u1))%2 == 0 {
-						u2--
-					}
-					if array[(t<<3)|u2].h == gv.h && array[(t<<3)|u2].w == gv.w && array[(t<<3)|u2].avgLuma-gv.avgLuma < margChar {
-						v2 := u2 + 1
-						for v2 < 8 && (boolArray[t]>>uint8(v2))%2 == 1 && array[(t<<3)|u2].h == gv.h && array[(t<<3)|u2].w == gv.w && array[(t<<3)|u2].avgLuma-gv.avgLuma < margChar {
-							v2++
-						}
-						doublet := compareGridBool(array, margin, a, t, boolArray[a], boolArray[t], u1, v2, u2, v2)
-						newA := uint8(doublet % 256)
-						/*If the first octet has changed, make the necessary adjustments*/
-						if newA != boolArray[a] {
-							if newA != 0 {
-								u1 := uint32(firstSet(newA))
-								for u1 > 0 && (a<<3)+u1 >= uint32(len(array)) {
-									u1--
-								}
-								for u1 > 0 && (newA>>uint8(u1))%2 == 0 {
-									u1--
-								}
-								v1 = uint32(lastSet(newA, uint8(u1)+1))
-								for v1 > u1 && (a<<3)+(v1-1) >= uint32(len(array)) {
-									v1--
-								}
-								for v1 > u1 && (newA>>uint8(v1-1))%2 == 0 {
-									v1--
-								}
-								gv = array[(a<<3)+(v1-1)]
-							}
-							boolArray[a] = newA
-						}
-						boolArray[t] = uint8(doublet >> 8)
-					}
-				}
-			}(t)
-		}
-		wg.Wait()
-	}
-	/*for i := a + 1; boolArray[a] != 0 && i < b; i++ {
+	for i := a + 1; boolArray[a] != 0 && i < b; i++ {
 		if boolArray[i] != 0 {
 			u2 := uint32(firstSet(boolArray[i]))
 			for u2 > 0 && (i<<3)+u2 >= uint32(len(array)) {
@@ -765,42 +658,32 @@ func compareDoubles(boolArray []uint8, a uint32, b uint32, array []Grid, u1 uint
 				for v2 < 8 && boolArray[i]>>uint8(v2) == 1 && array[(i<<3)+v2].h == gv.h && array[(i<<3)+v2].w == gv.w {
 					v2++
 				}
-				if compCond == 1 ||
-					(compCond == 0 && array[(i<<3)+u2].maxLuma-array[(i<<3)+u2].minLuma < margChar) ||
-					(compCond == 2 && array[(i<<3)+u2].maxLuma-array[(i<<3)+u2].minLuma > margChar) {
-					doublet := compareGridBool(array, margin, a, i, boolArray[a], boolArray[i], u1, v2, u2, v2)
-					newA := uint8(doublet % 256)
-					if newA != boolArray[a] {
-						if newA != 0 {
-							u1 := uint32(firstSet(newA))
-							for u1 > 0 && (a<<3)+u1 >= uint32(len(array)) {
-								u1--
-							}
-							for u1 > 0 && (newA>>uint8(u1))%2 == 0 {
-								u1--
-							}
-							v1 = uint32(lastSet(newA, uint8(u1)+1))
-							for v1 > u1 && (a<<3)+(v1-1) >= uint32(len(array)) {
-								v1--
-							}
-							for v1 > u1 && (newA>>uint8(v1-1))%2 == 0 {
-								v1--
-							}
-							gv = array[(a<<3)+(v1-1)]
-							if array[(a<<3)+u1].maxLuma-array[(a<<3)+u1].minLuma > margChar {
-								compCond = 2
-							}
-							if array[(a<<3)+(v1-1)].maxLuma-array[(a<<3)+(v1-1)].minLuma > margChar {
-								compCond = 1
-							}
+				doublet := compareGridBool(array, margin, a, i, boolArray[a], boolArray[i], u1, v2, u2, v2)
+				newA := uint8(doublet % 256)
+				if newA != boolArray[a] {
+					if newA != 0 {
+						u1 := uint32(firstSet(newA))
+						for u1 > 0 && (a<<3)+u1 >= uint32(len(array)) {
+							u1--
 						}
-						boolArray[a] = newA
+						for u1 > 0 && (newA>>uint8(u1))%2 == 0 {
+							u1--
+						}
+						v1 = uint32(lastSet(newA, uint8(u1)+1))
+						for v1 > u1 && (a<<3)+(v1-1) >= uint32(len(array)) {
+							v1--
+						}
+						for v1 > u1 && (newA>>uint8(v1-1))%2 == 0 {
+							v1--
+						}
+						gv = array[(a<<3)+(v1-1)]
 					}
-					boolArray[i] = uint8(doublet >> 8)
+					boolArray[a] = newA
 				}
+				boolArray[i] = uint8(doublet >> 8)
 			}
 		}
-	}*/
+	}
 }
 
 /*
@@ -919,8 +802,6 @@ func restructuredBoolArray(boolArray []uint8, boolLen uint32, array []Grid, arra
 
 /*This eliminates grids that are similar within a margin.*/
 func removeRedundantGrids(array []Grid, margin float64, tNum uint32) []Grid {
-	singleTime := int64(0)
-	doubleTime := int64(0)
 	arrayLen := uint32(len(array))
 	margInt := uint8(margin * 256.0)
 
@@ -983,7 +864,6 @@ func removeRedundantGrids(array []Grid, margin float64, tNum uint32) []Grid {
 					/*If the octet has at least two remaining grids, compare within the octet, and readjust
 					the bounds if necessary.*/
 					if v > u+1 {
-						singleStart := time.Now().UnixNano()
 						boolArray[i] = compareGridBoolSingle(array, margin, i, boolArray[i], u, v)
 						if (boolArray[i]>>u)%2 == 0 {
 							u = uint32(firstSet(boolArray[i]))
@@ -1003,13 +883,10 @@ func removeRedundantGrids(array []Grid, margin float64, tNum uint32) []Grid {
 								v--
 							}
 						}
-						singleEnd := time.Now().UnixNano()
-						singleTime += (singleEnd - singleStart)
 					}
 					/*Unlike comparing within a single octet, comparison across
 					octets does not require any of them have multiple grids
 					remaining.*/
-					doubleStart := time.Now().UnixNano()
 					gv := array[(i<<3)+(v-1)]
 					var j uint32
 					/*Find the last grid "in reach" of the last one in the current octet.*/
@@ -1031,8 +908,6 @@ func removeRedundantGrids(array []Grid, margin float64, tNum uint32) []Grid {
 					if j > i+1 {
 						compareDoubles(boolArray, i, j, array, u, v, margin, tNum)
 					}
-					doubleEnd := time.Now().UnixNano()
-					doubleTime += (doubleEnd - doubleStart)
 				}
 			}
 		}
@@ -1041,10 +916,6 @@ func removeRedundantGrids(array []Grid, margin float64, tNum uint32) []Grid {
 	/*Shuffle around the grids so that all the remaining ones are at
 	the beginning and all eliminated ones are at the end.*/
 	restructuredBoolArray(boolArray, boolLen, array, arrayLen)
-	fmt.Println("Time to compare single octets: ")
-	printTime(singleTime)
-	fmt.Println("Time to compare across octets: ")
-	printTime(doubleTime)
 	return array
 }
 
@@ -1140,7 +1011,6 @@ func gridsFromCoords(img [][][]uint8, trees []*Tree) []Grid {
 	coordArray := make([][]uint32, totalLeafNum)
 	tempLeafNum := uint32(0)
 	for i := 0; i < len(trees); i++ {
-		fmt.Printf("%d/%d\n", i, len(trees))
 		coordsFromTree(trees[i], coordArray, tempLeafNum)
 		l := uint32(trees[i].leafNum)
 		//sort.Slice(coordArray, func(i, j int) bool { return j < int(tempLeafNum) || i >= int(tempLeafNum+l) || coordArray[j][1]-coordArray[j][0] > coordArray[i][1]-coordArray[i][0] || (coordArray[j][1]-coordArray[j][0] == coordArray[i][1]-coordArray[i][0] && coordArray[j][3]-coordArray[j][2] > coordArray[i][3]-coordArray[i][2])})
@@ -1151,7 +1021,6 @@ func gridsFromCoords(img [][][]uint8, trees []*Tree) []Grid {
 	gridArray := make([]Grid, totalLeafNum)
 	tempLeafNum = 0
 	for i := 0; i < len(img); i++ {
-		fmt.Printf("%d/%d\n", i, len(img))
 		leafNum := uint32(trees[i].leafNum)
 		for j := uint32(0); j < leafNum; j++ {
 			gridArray[tempLeafNum+j] = gridFromImg(img[i], coordArray[tempLeafNum+j][0], coordArray[tempLeafNum+j][1], coordArray[tempLeafNum+j][2], coordArray[tempLeafNum+j][3])
