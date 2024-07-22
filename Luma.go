@@ -15,13 +15,11 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
 var start = time.Now().UnixNano()
 var arraySize = 0
-var wg sync.WaitGroup
 
 /*Absolute difference between two unsigned 8-bit numbers.*/
 func byteAbsDiff(a uint8, b uint8) uint8 {
@@ -206,7 +204,16 @@ type Tree struct {
 
 /*This is a recursive instantiation method for a tree.*/
 func generateTree(x1In uint32, x2In uint32, y1In uint32, y2In uint32, minIn uint8, maxIn uint8) *Tree {
-	t := Tree{x1: x1In, x2: x2In, y1: y1In, y2: y2In, maxValid: maxIn, minValid: minIn, hasChildren: 0}
+	t := Tree{
+		x1:          x1In,
+		x2:          x2In,
+		y1:          y1In,
+		y2:          y2In,
+		minValid:    minIn,
+		maxValid:    maxIn,
+		hasChildren: 0,
+		leafNum:     0,
+	}
 	if t.x2-t.x1 > uint32(maxIn) && (t.y2-t.y1 <= uint32(maxIn) || rand.Uint32()%2 != 1) {
 		/*low := t.x2-t.x1
 		high := 0*/
@@ -312,7 +319,7 @@ func gridDiffFast(g1 Grid, g2 Grid, maxDiff uint8, crossRange uint8) uint32 {
 	sum := uint32(0)
 	h32 := uint32(g1.h)
 	area := uint32(g1.w) * h32
-	maxSum := uint32(maxDiff) * uint32(g1.w) * uint32(g1.h)
+	maxSum := uint32(maxDiff) * area
 	var pixel1, pixel2 uint8
 	i := uint32(0)
 	cr32 := uint32(crossRange)
@@ -335,25 +342,24 @@ func gridDiffAlt(g1 Grid, g2 Grid, maxDiff uint8) uint32 {
 	if g1.w != g2.w || g1.h != g2.h {
 		return math.MaxUint32
 	}
-	/*Obviously, if the lowest of one grid is maxDiff above the maximum of the other grid,
-	then all corresponding pixels have a difference greater than or equal to maxDiff.*/
 	if (g2.maxLuma < 255-maxDiff && g1.minLuma > g2.maxLuma+maxDiff) || (g1.maxLuma < 255-maxDiff && g2.minLuma > g1.maxLuma+maxDiff) {
 		return math.MaxUint32
 	}
 	sum := uint32(0)
+	w32 := uint32(g1.w)
 	h32 := uint32(g1.h)
 	area := uint32(g1.w) * h32
-	maxSum := uint32(maxDiff) * uint32(g1.w) * uint32(g1.h)
+	maxSum := uint32(maxDiff) * area
 	var pixel1, pixel2 uint8
-	i := uint32(0)
-	/*The third condition determines if there is still a mathematic possibility for the
-	sum to exceed the maximum designated sum. Maintaining this loop to the end indeed
-	is a tightrope balance, but adding this third condition solved a slowdown issue.*/
-	for i < area && sum < maxSum {
-		pixel1 = g1.array[i/h32][i%h32]
-		pixel2 = g2.array[i/h32][i%h32]
-		sum += uint32(byteAbsDiff(pixel1, pixel2))
-		i++
+	for i := uint32(0); i < w32; i++ {
+		for j := uint32(0); j < h32; j++ {
+			pixel1 = g1.array[i][j]
+			pixel2 = g2.array[i][j]
+			sum += uint32(byteAbsDiff(pixel1, pixel2))
+			if sum > maxSum {
+				return sum
+			}
+		}
 	}
 	return sum
 }
@@ -668,7 +674,7 @@ func lastSet(octet uint8, u uint8) uint8 {
 }
 
 /*This is the intermediary between removeRedundantGrids and compareGridBool.*/
-func compareDoubles(boolArray []uint8, a uint32, b uint32, array []Grid, u1 uint32, v1 uint32, margin float64, tNum uint32) {
+func compareDoubles(boolArray []uint8, a uint32, b uint32, array []Grid, u1 uint32, v1 uint32, margin float64) {
 	margChar := uint8(margin * 256.0)
 	gv := array[(a<<3)+(v1-1)]
 	for i := a + 1; boolArray[a] != 0 && i < b; i++ {
@@ -828,7 +834,7 @@ func restructuredBoolArray(boolArray []uint8, boolLen uint32, array []Grid, arra
 }
 
 /*This eliminates grids that are similar within a margin.*/
-func removeRedundantGrids(array []Grid, margin float64, tNum uint32) []Grid {
+func removeRedundantGrids(array []Grid, margin float64) []Grid {
 	arrayLen := uint32(len(array))
 	margInt := uint8(margin * 256.0)
 
@@ -933,7 +939,7 @@ func removeRedundantGrids(array []Grid, margin float64, tNum uint32) []Grid {
 					/*If at least octet has at least one grid that is comparable to at least
 					one in the current octet, make comparisons.*/
 					if j > i+1 {
-						compareDoubles(boolArray, i, j, array, u, v, margin, tNum)
+						compareDoubles(boolArray, i, j, array, u, v, margin)
 					}
 				}
 			}
@@ -964,32 +970,46 @@ func gridFromImg(img [][]uint8, x1 uint32, x2 uint32, y1 uint32, y2 uint32) Grid
 		panic("Dimensions above 255 not supported")
 	}
 
-	g := Grid{w: uint8(x2 - x1), h: uint8(y2 - y1)}
-	h32 := uint32(g.h)
-	w32 := uint32(g.w)
-	g.array = make([][]uint8, g.w)
-	g.maxLuma = 0
-	g.minLuma = 255
+	w := uint8(x2 - x1)
+	h := uint8(y2 - y1)
+	h32 := uint32(h)
+	w32 := uint32(w)
+
+	g := Grid{
+		w:       w,
+		h:       h,
+		avgLuma: 0,
+		medLuma: 0,
+		maxLuma: 0,
+		minLuma: 255,
+		array:   make([][]uint8, w),
+		sum:     0,
+	}
+
+	maxLuma := uint8(0)
+	minLuma := uint8(255)
 	sum := uint32(0)
 
 	/*Get a pixel from the image, determine whether
 	it is higher or lower than previous pixels, add
 	it to the sum, and then place it into the grid.*/
 	for i := uint32(0); i < w32; i++ {
-		g.array[i] = make([]uint8, g.h)
+		g.array[i] = make([]uint8, h)
 		for j := uint32(0); j < h32; j++ {
 			p := img[x1+i][y1+j]
-			if p > g.maxLuma {
-				g.maxLuma = p
+			if p > maxLuma {
+				maxLuma = p
 			}
-			if p < g.minLuma {
-				g.minLuma = p
+			if p < minLuma {
+				minLuma = p
 			}
 			sum += uint32(p)
 			g.array[i][j] = p
 		}
 	}
 
+	g.maxLuma = maxLuma
+	g.minLuma = minLuma
 	g.avgLuma = uint8(sum / (h32 * w32))
 
 	return g
@@ -1104,7 +1124,7 @@ This function breaks down an image into individual parts and traces them into a 
 using the most similar fragments of images previously processed. It is the primary reason
 this program exists.
 */
-func lumaTrace(img [][]uint8, ymg [][]uint8, array []Grid, arrayLen uint32, t *Tree, tNum uint32) [][]uint8 {
+func lumaTrace(img [][]uint8, ymg [][]uint8, array []Grid, arrayLen uint32, t *Tree) [][]uint8 {
 	gridMap := make(map[uint32]Grid)
 	/*This takes in an image (or a monochrome representation of one) along with a tree to
 	subdivide it, and puts the grids created from the subdivisions and their coordinates in
@@ -1238,54 +1258,6 @@ func lumaTrace(img [][]uint8, ymg [][]uint8, array []Grid, arrayLen uint32, t *T
 				}
 			}
 		}
-		/*wg.Add(int(tNum))
-		for k := uint32(0); k < tNum; k++ {
-			go func(k uint32) {
-				defer wg.Done()*/
-		/*Each core will cover a different segment of the array before and after the initial guess.
-		If there is no mathematical way for even the beginning of the segment in question to be
-		more similar to the grid in the map vis a vis the most similar thus far found, the for loop
-		below simply doesn't start. If it might be, it looks at each grid in the segment, and only
-		when demonstrating there is mathematically enough similarity to the grid in the map to
-		warrant a comparison, checks to see if the grid is more similar. These levels of gatekeeping
-		solved a bottleneck that previously caused an image to take minutes to trace.*/
-		/*loopStart := a + (k * (l2 - a) / tNum) + 1
-				loopEnd := a + (((k + 1) * (l2 - a)) / tNum) - ((k + 1) / tNum)
-				for j := loopStart; j <= loopEnd; j++ {
-					if byteAbsDiff(g.avgLuma, array[j].avgLuma) < minDiffInt && (g.maxLuma > 255-minDiffInt || array[j].minLuma < g.maxLuma+minDiffInt) && (array[j].maxLuma > 255-minDiffInt || g.minLuma < array[j].maxLuma+minDiffInt) {
-						crossRange := getCrossRange(array[j], g)
-						var diffTemp uint32
-						if crossRange >= minDiffInt {
-							diffTemp = gridDiffAlt(array[j], g, minDiffInt, crossRange)
-						} else {
-							diffTemp = uint32(crossRange) * uint32(g.w) * uint32(g.h)
-						}
-						if diffTemp < uint32(minDiffInt)*uint32(g.w)*uint32(g.h) {
-							minDiffInt = uint8(diffTemp / (uint32(g.w) * uint32(g.h)))
-							minDiffC = j
-						}
-					}
-				}
-				loopStart = a - (k * (a - l1) / tNum) - 1
-				loopEnd = a - (((k + 1) * (a - l1)) / tNum)
-				for j := loopStart; j >= loopEnd; j-- {
-					if byteAbsDiff(g.avgLuma, array[j].avgLuma) < minDiffInt && (g.maxLuma > 255-minDiffInt || array[j].minLuma < g.maxLuma+minDiffInt) && (array[j].maxLuma > 255-minDiffInt || g.minLuma < array[j].maxLuma+minDiffInt) {
-						crossRange := getCrossRange(array[j], g)
-						var diffTemp uint32
-						if crossRange >= minDiffInt {
-							diffTemp = gridDiffAlt(array[j], g, minDiffInt, crossRange)
-						} else {
-							diffTemp = uint32(crossRange) * uint32(g.w) * uint32(g.h)
-						}
-						if diffTemp < uint32(minDiffInt)*uint32(g.w)*uint32(g.h) {
-							minDiffInt = uint8(diffTemp / (uint32(g.w) * uint32(g.h)))
-							minDiffC = j
-						}
-					}
-				}
-			}(k)
-		}
-		wg.Wait()*/
 		/*The coordinates are stored in the map, in a way involving bitwise operations. This simply
 		reverses those operations to get separate x and y values.*/
 		x1 := keys[i] >> 16
@@ -1345,7 +1317,16 @@ func readFromFile(fName string) ([]Grid, error) {
 			return nil, err
 		}
 		if w != 0 && h != 0 {
-			g := Grid{w: w, h: h, maxLuma: 0, minLuma: 255, avgLuma: 128}
+			g := Grid{
+				w:       w,
+				h:       h,
+				avgLuma: 128,
+				medLuma: 0,
+				maxLuma: 0,
+				minLuma: 255,
+				array:   [][]uint8{},
+				sum:     0,
+			}
 			sum := uint32(0)
 			g.array = make([][]uint8, w)
 			var x, p uint8
@@ -1407,18 +1388,18 @@ func writeToFile(array []Grid, arrayLen uint32, fName string) error {
 }
 
 /*Combine two arrays.*/
-func combineArrays(array1 []Grid, array2 []Grid, margin float64, tNum uint32) []Grid {
+func combineArrays(array1 []Grid, array2 []Grid, margin float64) []Grid {
 	array1 = append(array1, array2...)
 	sort.Slice(array1, func(i, j int) bool { return lessGrid(array1[i], array1[j], false) })
 	start = time.Now().UnixNano()
-	array1 = removeRedundantGrids(array1, margin, tNum)
+	array1 = removeRedundantGrids(array1, margin)
 	return array1
 }
 
 /*Generate an image object from an image file.*/
 func openImage(path string) (image.Image, error) {
 	f, err := os.Open(path)
-	if nil != err {
+	if err != nil {
 		fmt.Println(err)
 		return nil, err
 	}
@@ -1441,51 +1422,30 @@ func openImage(path string) (image.Image, error) {
 }
 
 /*Convert an image to monocrhome and store it in an integer array*/
-func convertToGrayscale(img image.Image, w int, h int, tNum uint32) [][]uint8 {
+func convertToGrayscale(img image.Image, w int, h int) [][]uint8 {
 	mono := make([][]uint8, w)
-	tNumAct := tNum
-	colPer := 1
-	if w > int(tNum) {
-		colPer = w / int(tNum)
-	} else if uint32(w) < tNum {
-		tNumAct = uint32(w)
+	for x := 0; x < w; x++ {
+		mono[x] = make([]uint8, h)
 	}
 	/*Simply drop in the grayscale values for an image that is
 	already monochrome.*/
-	if strings.HasSuffix(strings.ToLower(reflect.TypeOf(img).String()), "gray") {
-		wg.Add(int(tNumAct))
-		for t := uint32(0); t < tNumAct; t++ {
-			go func(t uint32) {
-				defer wg.Done()
-				for x := 0; x < colPer; x++ {
-					mono[x+(int(t)*colPer)] = make([]uint8, h)
-					for y := 0; y < h; y++ {
-						l, _, _, _ := img.At(x+(int(t)*colPer), y).RGBA()
-						mono[x+(int(t)*colPer)][y] = uint8(l >> 8)
-					}
-				}
-			}(t)
+	if grayImg, ok := img.(*image.Gray); ok {
+		for x := 0; x < w; x++ {
+			for y := 0; y < h; y++ {
+				mono[x][y] = grayImg.GrayAt(x, y).Y
+			}
 		}
-		wg.Wait()
 	} else {
 		/*Use basic color math to generate grayscale values*/
-		wg.Add(int(tNumAct))
-		for t := uint32(0); t < tNumAct; t++ {
-			go func(t uint32) {
-				defer wg.Done()
-				for x := 0; x < colPer; x++ {
-					mono[x+(int(t)*colPer)] = make([]uint8, h)
-					for y := 0; y < h; y++ {
-						r, g, b, _ := img.At(x+(int(t)*colPer), y).RGBA()
-						r >>= 8
-						g >>= 8
-						b >>= 8
-						mono[x+(int(t)*colPer)][y] = grayscale(uint8(r), uint8(g), uint8(b))
-					}
-				}
-			}(t)
+		for x := 0; x < w; x++ {
+			for y := 0; y < h; y++ {
+				r, g, b, _ := img.At(x, y).RGBA()
+				r >>= 8
+				g >>= 8
+				b >>= 8
+				mono[x][y] = grayscale(uint8(r), uint8(g), uint8(b))
+			}
 		}
-		wg.Wait()
 	}
 	return mono
 }
@@ -1581,6 +1541,7 @@ func colorize(img image.Image, array1 [][]uint8, array2 [][]uint8, w int, h int)
 
 func main() {
 	rand.Seed(time.Now().UnixNano())
+
 	/*The following options are as such:
 	-i	Used to specify an input image or set of input images with a
 		minimum and maximum grid size and a margin of error, in order
@@ -1598,7 +1559,6 @@ func main() {
 	lArray := make([]string, 0)
 	yArray := make([]string, 0)
 	oArray := make([]string, 0)
-	tArray := make([]string, 0)
 	array := make([]Grid, 0)
 	var arrayLen uint32
 	args := os.Args
@@ -1651,16 +1611,8 @@ func main() {
 			fmt.Println("	-o	Output an image or set of images created by a trace.")
 			fmt.Println("	-k	Save a dataset")
 			fmt.Println("e.g.	(-i or -l option) -k newDataSet")
-			fmt.Println("	-t	Set number of threads, default 1.")
 			fmt.Println("The original purpose of this program was to make digitally-created images appear hand-drawn. However, it can be used for texturing of any kind.")
 			return
-		} else if args[i] == "-t" {
-			j := i + 1
-			for j < len(args) && args[j][0] != 45 {
-				tArray = append(tArray, args[j])
-				j++
-			}
-			i = j - 1
 		}
 	}
 	/*These handle discoordinate arguments and arguments with an incorrect number of
@@ -1710,24 +1662,6 @@ func main() {
 		fmt.Println("Please specify at least one base image file, minimum and maximum grid dimensions, in that exact order.")
 		return
 	}
-	if len(tArray) > 1 {
-		fmt.Println("Please specify one argument for thread number.")
-		return
-	}
-	/*This handles inputting one or more file containing a grid array.*/
-	tNum := uint32(1)
-	if len(tArray) == 1 {
-		tNum, err := strconv.ParseUint(tArray[0], 10, 8)
-		if err != nil {
-			fmt.Println("Please specify an integer for thread number")
-			log.Fatal(err)
-			return
-		}
-		if tNum < 1 {
-			fmt.Println("Please specify a positive integer for thread number")
-			return
-		}
-	}
 	if len(lArray) > 0 {
 		fmt.Println("Adding data from " + lArray[0])
 		arrayTemp, err := readFromFile(lArray[0])
@@ -1769,7 +1703,7 @@ func main() {
 						arrayLen--
 					}
 				}
-				array = combineArrays(array, arrayTemp, margin, tNum)
+				array = combineArrays(array, arrayTemp, margin)
 				n1 := uint32(0)
 				n2 := uint32(len(array))
 				var m uint32
@@ -1824,7 +1758,7 @@ func main() {
 			imgBnd := img.Bounds()
 			w := imgBnd.Max.X
 			h := imgBnd.Max.Y
-			imgArray[i] = convertToGrayscale(img, w, h, tNum)
+			imgArray[i] = convertToGrayscale(img, w, h)
 			monoTime += (time.Now().UnixNano() - monoStart)
 			trees[i] = generateTree(0, uint32(w), 0, uint32(h), uint8(minIn), uint8(maxIn))
 			start = time.Now().UnixNano()
@@ -1843,7 +1777,7 @@ func main() {
 		if margin > 0 {
 			fmt.Println("Removing redundant grids")
 			start = time.Now().UnixNano()
-			array = removeRedundantGrids(array, margin, tNum)
+			array = removeRedundantGrids(array, margin)
 			n1 := uint32(0)
 			n2 := uint32(len(array))
 			var m uint32
@@ -2002,7 +1936,7 @@ func main() {
 			t := generateTree(0, uint32(w), 0, uint32(h), uint8(minIn), uint8(maxIn))
 			/*To make things simpler, all images are converted to monochrome and stored in an
 			array of 8-bit numbers. Color is restored in the resulting image.*/
-			mono := convertToGrayscale(img, w, h, tNum)
+			mono := convertToGrayscale(img, w, h)
 			monoNew := make([][]uint8, w)
 			for i := 0; i < w; i++ {
 				monoNew[i] = make([]uint8, h)
@@ -2014,7 +1948,7 @@ func main() {
 			fmt.Println("Performing luma trace on " + yArray[i])
 			start = time.Now().UnixNano()
 			startTemp := start
-			monoNew = lumaTrace(mono, monoNew, array, arrayLen, t, uint32(tNum))
+			monoNew = lumaTrace(mono, monoNew, array, arrayLen, t)
 			end := time.Now().UnixNano()
 			printTime(end - startTemp)
 
