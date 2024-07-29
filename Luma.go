@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"image"
 	"image/color"
+	"image/draw"
+	_ "image/gif"
+	_ "image/jpeg"
 	"image/png"
 	"log"
 	"math"
@@ -15,11 +18,16 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	_ "golang.org/x/image/bmp"
+	_ "golang.org/x/image/tiff"
 )
 
 var start = time.Now().UnixNano()
-var arraySize = 0
+
+var wg sync.WaitGroup
 
 /*Absolute difference between two unsigned 8-bit numbers.*/
 func byteAbsDiff(a uint8, b uint8) uint8 {
@@ -215,9 +223,7 @@ func generateTree(x1In uint32, x2In uint32, y1In uint32, y2In uint32, minIn uint
 		leafNum:     0,
 	}
 	if t.x2-t.x1 > uint32(maxIn) && (t.y2-t.y1 <= uint32(maxIn) || rand.Uint32()%2 != 1) {
-		/*low := t.x2-t.x1
-		high := 0*/
-		mid := (t.x1 + uint32(t.minValid)) + (rand.Uint32() % (t.x2 - t.x1 - uint32(t.minValid)))
+		mid := (t.x1 + uint32(t.minValid)) + (rand.Uint32() % (t.x2 - t.x1 - (2 * uint32(t.minValid))))
 		for mid-t.x1 < uint32(t.minValid) || t.x2-mid < uint32(t.minValid) {
 			mid = (t.x1 + uint32(t.minValid)) + (rand.Uint32() % (t.x2 - t.x1 - uint32(t.minValid)))
 		}
@@ -226,7 +232,7 @@ func generateTree(x1In uint32, x2In uint32, y1In uint32, y2In uint32, minIn uint
 		t.rTree = generateTree(mid, t.x2, t.y1, t.y2, t.minValid, t.maxValid)
 		t.leafNum = t.lTree.leafNum + t.rTree.leafNum
 	} else if t.y2-t.y1 > uint32(maxIn) {
-		mid := (t.y1 + uint32(t.minValid)) + (rand.Uint32() % (t.y2 - t.y1 - uint32(t.minValid)))
+		mid := (t.y1 + uint32(t.minValid)) + (rand.Uint32() % (t.y2 - t.y1 - (2 * uint32(t.minValid))))
 		for mid-t.y1 < uint32(t.minValid) || t.y2-mid < uint32(t.minValid) {
 			mid = (t.y1 + uint32(t.minValid)) + (rand.Uint32() % (t.y2 - t.y1 - uint32(t.minValid)))
 		}
@@ -269,11 +275,15 @@ func gridDiffMax(g1 Grid, g2 Grid, maxIn uint8) uint8 {
 	h := uint32(g1.h)
 	w := uint32(g1.w)
 	var c1, c2, flr, clg uint8
+	/*The floor, which is below the maximum value of
+	g2.*/
 	if g2.maxLuma < maxIn {
 		flr = 0
 	} else {
 		flr = g2.maxLuma - maxIn
 	}
+	/*The ceiling, which is above the minimum value of
+	g2.*/
 	if g2.maxLuma > 255-maxIn {
 		clg = 255
 	} else {
@@ -318,11 +328,73 @@ func gridDiffFast(g1 Grid, g2 Grid, maxDiff uint8, crossRange uint8) uint32 {
 	}
 	sum := uint32(0)
 	h32 := uint32(g1.h)
-	area := uint32(g1.w) * h32
+	w32 := uint32(g1.w)
+	area := w32 * h32
 	maxSum := uint32(maxDiff) * area
 	var pixel1, pixel2 uint8
 	i := uint32(0)
 	cr32 := uint32(crossRange)
+	/*If the area is less than or equal to 16, a quarter of the time or more will be spent
+	checking corners. This performs the corner checking followed by the other pixels. Other
+	measures in the program ensure that no corner checking takes places in grids with such
+	dimensions beforehand.*/
+	if area <= 16 {
+		w32--
+		h32--
+		pixel1 = g1.array[0][0]
+		pixel2 = g2.array[0][0]
+		tempDiff := byteAbsDiff(pixel1, pixel2)
+		if tempDiff > maxDiff {
+			return maxSum
+		}
+		sum += uint32(tempDiff)
+		pixel1 = g1.array[0][h32]
+		pixel2 = g2.array[0][h32]
+		tempDiff = byteAbsDiff(pixel1, pixel2)
+		if tempDiff > maxDiff {
+			return maxSum
+		}
+		sum += uint32(tempDiff)
+		pixel1 = g1.array[w32][0]
+		pixel2 = g2.array[w32][0]
+		tempDiff = byteAbsDiff(pixel1, pixel2)
+		if tempDiff > maxDiff {
+			return maxSum
+		}
+		sum += uint32(tempDiff)
+		pixel1 = g1.array[w32][h32]
+		pixel2 = g2.array[w32][h32]
+		tempDiff = byteAbsDiff(pixel1, pixel2)
+		if tempDiff > maxDiff {
+			return maxSum
+		}
+		sum += uint32(tempDiff)
+		/*There is at least one row and one column, along with at least one of their
+		intersections, that will be unexplored by the corner calculation.*/
+		/*Check the right and left columns, and then the middle*/
+		i = 1
+		if sum+((area-4)*cr32) > maxSum {
+			for i < h32 && sum < maxSum && sum+((area-4-(2*i))*cr32) > maxSum {
+				pixel1 = g1.array[0][i]
+				pixel2 = g2.array[0][i]
+				sum += uint32(byteAbsDiff(pixel1, pixel2))
+				pixel1 = g1.array[w32][i]
+				pixel2 = g2.array[w32][i]
+				sum += uint32(byteAbsDiff(pixel1, pixel2))
+				i++
+			}
+			w32++
+			h32++
+			i = h32
+			for i < area-1 && sum < maxSum && sum+(area-(2*h32)-i) > maxSum {
+				pixel1 = g1.array[i/h32][i%h32]
+				pixel2 = g2.array[i/h32][i%h32]
+				sum += uint32(byteAbsDiff(pixel1, pixel2))
+				i++
+			}
+		}
+		return sum
+	}
 	/*The third condition determines if there is still a mathematic possibility for the
 	sum to exceed the maximum designated sum. Maintaining this loop to the end indeed
 	is a tightrope balance, but adding this third condition solved a slowdown issue.*/
@@ -338,6 +410,12 @@ func gridDiffFast(g1 Grid, g2 Grid, maxDiff uint8, crossRange uint8) uint32 {
 	return sum
 }
 
+/*
+This performs essentially the same function as above, but does not have
+a mechanism to leave early. Since this is used in the luma trace rather
+than to determine which grids may remain in a dataset, it also lacks
+corner comparison.
+*/
 func gridDiffAlt(g1 Grid, g2 Grid, maxDiff uint8) uint32 {
 	if g1.w != g2.w || g1.h != g2.h {
 		return math.MaxUint32
@@ -533,7 +611,7 @@ func compareGridBoolSingle(array []Grid, margin float64, cursor uint32, octet ui
 						two justifications for elimination: if the ranges are small and the overall difference
 						is small; or if the ranges are large, while the largest difference between any
 						corresponding pixels is still small.*/
-						if crossRange < margInt || (maxCornerDiff(a1, a2, margInt) < margInt && ((range1 < margInt && gridDiffFast(a1, a2, margInt, crossRange) < uint32(margInt)*area) || (range1 >= margInt && gridDiffMax(a1, a2, margInt) < margInt))) {
+						if crossRange < margInt || ((a1.w < 16 && a1.h < 16 && a1.w*a1.h <= 16 || maxCornerDiff(a1, a2, margInt) < margInt) && ((range1 < margInt && gridDiffFast(a1, a2, margInt, crossRange) < uint32(margInt)*area) || (range1 >= margInt && gridDiffMax(a1, a2, margInt) < margInt))) {
 							if rand.Uint32()%2 == 0 {
 								octet &= (^(1 << uint8(w1)))
 							} else {
@@ -549,103 +627,296 @@ func compareGridBoolSingle(array []Grid, margin float64, cursor uint32, octet ui
 }
 
 /*
-This compares grids across two octets.
+This executes the gridDiff functions above based on the range of the grids.
+Various other statements prevent this from executing unless the range of both
+is either above the margin or below the margin.
 */
-func compareGridBool(array []Grid, margin float64, cursor1 uint32, cursor2 uint32, bool1 uint8, bool2 uint8, u1 uint32, v1 uint32, u2 uint32, v2 uint32) uint16 {
+func rangeMaxCheck(r uint8, a1 Grid, a2 Grid, margChar uint8, areaMarg uint32, crossRange uint8) bool {
+	return ((r < margChar && gridDiffFast(a1, a2, margChar, crossRange) < areaMarg) || (r >= margChar && gridDiffMax(a1, a2, margChar) < margChar))
+}
+
+/*
+This takes a predefined set of corners into account (unless the grids have
+an area 16 or below), and if similar executes the above check.
+*/
+func lumaCornerCheck(corner1 uint8, corner2 uint8, corner3 uint8, corner4 uint8, cornerA uint8, cornerB uint8, range1 uint8, a1 Grid, a2 Grid, margChar uint8, areaMarg uint32, crossRange uint8, edgeW uint8, edgeH uint8) bool {
+	return (cornerB > 255-margChar || a2.minLuma < cornerB+margChar) &&
+		(cornerA < margChar || a2.maxLuma > cornerA-margChar) &&
+		((a1.w < 16 && a1.h < 16 && a1.w*a1.h <= 16) || (byteAbsDiff(corner1, a2.array[0][0]) < margChar &&
+			byteAbsDiff(corner2, a2.array[0][edgeH]) < margChar &&
+			byteAbsDiff(corner3, a2.array[edgeW][0]) < margChar &&
+			byteAbsDiff(corner4, a2.array[edgeW][edgeH]) < margChar)) &&
+		rangeMaxCheck(range1, a1, a2, margChar, areaMarg, crossRange)
+}
+
+/*This compares a single grid to an entire octet of different grids.*/
+func compareSingleToOctet(array []Grid, margin float64, octet uint8, cursor uint32, u uint32, v uint32, g Grid) uint16 {
 	margChar := uint8(margin * 256.0)
+	edgeW := g.w
+	edgeH := g.h
+	edgeW--
+	edgeH--
+	var corner1, corner2, corner3, corner4, cornerA, cornerB uint8
+	if (edgeW+1)*(edgeH+1) > 16 {
+		corner1, corner2, corner3, corner4 = getCorners(g.array, edgeW, edgeH)
+		cornerA = minUint8(minUint8(corner1, corner2), minUint8(corner3, corner4))
+		cornerB = maxUint8(maxUint8(corner1, corner2), maxUint8(corner3, corner4))
+	}
+	range1 := g.maxLuma - g.minLuma
+	cursor *= 8
+	/*Area margin, if range1 is below the margin.*/
+	var areaMarg uint32
+	if range1 < margChar {
+		areaMarg = uint32(edgeW) * uint32(edgeH) * uint32(margChar)
+	}
+	for i := u; i < v; i++ {
+		if (octet>>uint8(i))%2 == 1 {
+			f := array[cursor+uint32(i)]
+			range2 := f.maxLuma - f.minLuma
+			if ((range1 < margChar && range2 < margChar) || (range1 >= margChar && range2 >= margChar)) && byteAbsDiff(f.avgLuma, g.avgLuma) < margChar {
+				crossRange := getCrossRange(g, f)
+				if crossRange < margChar || lumaCornerCheck(corner1, corner2, corner3, corner4, cornerA, cornerB, range1, g, f, margChar, areaMarg, crossRange, edgeW, edgeH) {
+					/*If the coin-toss removes a grid from the octet, its
+					corresponding bit is unset, like in other functions.
+					If it removes the single grid, the function returns
+					only the octet.*/
+					if rand.Uint32()%2 == 0 {
+						octet &= (^(1 << i))
+					} else {
+						return uint16(octet)
+					}
+				}
+			}
+		}
+	}
+	/*If the single grid makes it to the bitter end, the function
+	returns the octet plus a set bit at spot 9.*/
+	return uint16(256) + uint16(octet)
+}
+
+func maxUint8(x uint8, y uint8) uint8 {
+	if x > y {
+		return x
+	}
+	return y
+}
+func minUint8(x uint8, y uint8) uint8 {
+	if x < y {
+		return x
+	}
+	return y
+}
+
+func getCorners(array [][]uint8, edgeW uint8, edgeH uint8) (uint8, uint8, uint8, uint8) {
+	return array[0][0], array[0][edgeH], array[edgeW][0], array[edgeW][edgeH]
+}
+
+func comparableGrids(g1 Grid, g2 Grid, margChar uint8) bool {
+	if g1.h != g2.h && g1.w != g2.w {
+		return false
+	}
+	if g1.maxLuma-g1.minLuma < margChar {
+		if g2.maxLuma-g2.minLuma > margChar {
+			return false
+		}
+	} else if g2.maxLuma-g2.minLuma < margChar {
+		if g1.maxLuma-g1.minLuma > margChar {
+			return false
+		}
+	}
+	/*If either or both grids have a range exactly equal to
+	the margin, it will return true under the same conditions
+	as for two with ranges under or two with ranges over.*/
+	return byteAbsDiff(g2.avgLuma, g1.avgLuma) < margChar
+}
+
+/*
+This compares grids across two octets whose grids have similar
+areas 16 or below. Using a separate function allowed for
+optimizing corner comparison.
+*/
+func compareGridBoolSub16(array1 []Grid, array2 []Grid, margin float64, bool1 uint8, bool2 uint8, u1 uint8, v1 uint8, u2 uint8, v2 uint8) uint16 {
+	/*k: Stores the number of remaining bits in both octets, with the first
+	three being of the first, and the next three being of the last.*/
+	k := uint8((kern(bool2) * 8) + kern(bool1))
+	i := u1
+	j := u2
+	margChar := uint8(margin * 256.0)
+	/*Will continue as long as there are set bits in the first octet, but
+	can exit early if the number of set bits in either falls below 2.*/
+	for bool1>>i != 0 && k%8 > 1 && k>>3 > 1 {
+		if bool1&(1<<i) != 0 && bool2&(1<<j) != 0 {
+			if comparableGrids(array1[i], array2[j], margChar) {
+				crossRange := getCrossRange(array1[i], array2[j])
+				/*No corner comparison takes place here..*/
+				if crossRange < margChar || rangeMaxCheck(array1[i].maxLuma-array1[i].minLuma, array1[i], array2[j], margChar, uint32(array1[i].w)*uint32(array1[i].h)*uint32(margChar), crossRange) {
+					if rand.Uint32()%2 == 0 {
+						bool1 &= (^(1 << i))
+						k--
+					} else {
+						bool2 &= (^(1 << j))
+						k -= 8
+						for u2 < 8 && bool2&(1<<u2) == 0 {
+							u2++
+						}
+					}
+				}
+			}
+		}
+		/*If there are no more set bits in the second octet, loop back.*/
+		if bool2>>j == 0 {
+			j = u2
+			i++
+			/*Otherwise, just keep going with the second octet.*/
+		} else {
+			j++
+		}
+	}
+	/*If there is only one set bit in the first octet*/
+	if k%8 == 1 {
+		u1 = firstSet(bool1)
+		nonet := compareSingleToOctet(array2, margin, bool2, 0, 0, uint32(len(array2)), array1[u1])
+		/*If the only remaining grid from the first octet
+		did not survive, the first eight bits of the return
+		value will be zero; otherwise, they will mirror the
+		first octet. The last eight mirror the second octet
+		regardless.*/
+		return ((nonet >> 8) * uint16(bool1)) + ((nonet % 256) << 8)
+		/*If there is only one set bit in the second octet*/
+	} else if k>>3 == 1 {
+		u2 = firstSet(bool2)
+		/*Same rules as above, but flipped.*/
+		nonet := compareSingleToOctet(array1, margin, bool1, 0, 0, 8, array2[u2])
+		return ((nonet >> 8) * (uint16(bool2) << 8)) + (nonet % 256)
+	}
+	/*If there are multiple set bits in both octets to
+	the very end, return the two combined into a 16-bit
+	number.*/
+	return uint16(bool1) + (uint16(bool2) << 8)
+}
+
+func compareGridBool(array []Grid, margin float64, cursor1 uint32, cursor2 uint32, bool1 uint8, bool2 uint8, u1 uint32, v1 uint32, u2 uint32, v2 uint32) uint16 {
+	/*
+		k1: The number of grids remaining in the outer loop.
+		k2: The number of grids remaining in the inner loop.
+		margChar: The margin in 8-bit form.
+		margInt: The margin in 32-bit form.
+		v1_char: The cursor of the last set bit of the outer loop.
+		v2_char: The cursor of the last set bit of the inner loop.
+		u2_char: The cursor of the last set bit of the inner loop.
+		i: The cursor of the outer loop.
+		j: The cursor of the inner loop.
+
+		cursor1_mod: The cursor of the grid of the outer loop.
+		a1: Such a grid
+		edgeW: The width of the grid, minus 1.
+		edgeH: The height of the grid, minus 1.
+		areaMarg: The area of the grid times the margin in 32-bit form.
+		cursor2_mod: The cursor of the grid of the inner loop.
+	*/
+	k1 := uint8(kern(bool1))
+	k2 := uint8(kern(bool2))
+	margChar := uint8(margin * 256.0)
+	margInt := uint32(margChar)
 	v1_char := uint8(v1)
-	v2_char := uint8(v2)
 	u2_char := uint8(u2)
 	i := uint8(u1)
-	var a1 Grid
-	var crossRange, corner1, corner2, corner3, corner4, cornerA, cornerB, range1 uint8
 	j := u2_char
-	u1 += 255
 
-	/*The outer loop iterates through the first octet, and can be cut short if
-	at least one of the two octets is completely eliminated*/
-	for i < v1_char && bool1 != 0 && bool2 != 0 {
+	cursor1_mod := cursor1 << 3
+	a1 := array[cursor1_mod+u1]
+	edgeW := a1.w
+	edgeH := a1.h
+	areaMarg := uint32(edgeW) * uint32(edgeH) * margInt
+	edgeW--
+	edgeH--
+	cursor2_mod := (cursor1 << 3) + u2
+	corner1, corner2, corner3, corner4 := getCorners(a1.array, edgeW, edgeH)
+	cornerA := minUint8(minUint8(corner1, corner2), minUint8(corner3, corner4))
+	cornerB := maxUint8(maxUint8(corner1, corner2), maxUint8(corner3, corner4))
+
+	for i < v1_char && k1 > 1 && k2 > 1 {
 		/*If there is a remaining grid at i*/
-		if (bool1>>i)%2 != 0 {
+		if bool1&(1<<i) != 0 {
 			/*Since u1 was never going to exceed 7 nor used otherwise in this
 			loop, 255 is added to it when incrementing. This triggers the
 			routine below to reset various values to be compared below, which
 			resets u1 to its original value. This is because i might not
 			necessarily be incremented during a cycle of this loop, and this
 			prevents repeated reevaluations from grids which might have
-			already been eliminated..*/
+			already been eliminated.*/
 			if u1 > 255 {
 				u1 %= 255
-				a1 = array[(cursor1<<3)+uint32(i)]
-				range1 = a1.maxLuma - a1.minLuma
 				/*Calculating corners here provides a slight speed boost compared
 				to using maxCornerDiff.*/
-				corner1 = a1.array[0][0]
-				corner2 = a1.array[0][a1.h-1]
-				corner3 = a1.array[a1.w-1][0]
-				corner4 = a1.array[a1.w-1][a1.h-1]
-				cornerA = corner1
-				if corner2 < cornerA {
-					cornerA = corner2
-				}
-				if corner3 < cornerA {
-					cornerA = corner3
-				}
-				if corner4 < cornerA {
-					cornerA = corner4
-				}
-				cornerB = corner1
-				if corner2 > cornerB {
-					cornerB = corner2
-				}
-				if corner3 > cornerB {
-					cornerB = corner3
-				}
-				if corner4 > cornerB {
-					cornerB = corner4
-				}
-				j = u2_char
+				a1 := array[cursor1_mod]
+				edgeW = a1.w - 1
+				edgeH = a1.h - 1
+				corner1, corner2, corner3, corner4 = getCorners(a1.array, edgeW, edgeH)
+				cornerA = minUint8(minUint8(corner1, corner2), minUint8(corner3, corner4))
+				cornerB = maxUint8(maxUint8(corner1, corner2), maxUint8(corner3, corner4))
 			}
-			if j < v2_char {
-				/*If there is a remaining grid at j*/
-				if (bool2>>j)%2 != 0 {
-					a2 := array[(cursor2<<3)+uint32(j)]
-					range2 := a2.maxLuma - a2.minLuma
+			if bool2&(1<<j) != 0 {
+				if bool2&(1<<j) != 0 {
+					a2 := array[cursor2_mod]
 					/*Since comparison takes place across grids, there is still the
 					possibiility that two grids might have different dimensions or
 					substantially different average brightness levels, and
 					particularly different ranges.*/
-					if a2.h == a1.h && a2.w == a1.w && a2.avgLuma-a1.avgLuma < margChar && ((range1 < margChar && range2 < margChar) || (range1 >= margChar && range2 >= margChar)) {
-						crossRange = getCrossRange(a1, a2)
+					if comparableGrids(a1, a2, margChar) {
+						crossRange := getCrossRange(a1, a2)
 						/*Same rules apply as in compareGridBoolSingle to determine
 						whether either should be eliminated.*/
-						if crossRange < margChar || ((cornerB > 255-margChar || a2.minLuma < cornerB+margChar) &&
-							(cornerA < margChar || a2.maxLuma > cornerA-margChar) &&
-							byteAbsDiff(corner1, a2.array[0][0]) < margChar &&
-							byteAbsDiff(corner2, a2.array[0][a1.h-1]) < margChar &&
-							byteAbsDiff(corner3, a2.array[a1.w-1][0]) < margChar &&
-							byteAbsDiff(corner4, a2.array[a1.w-1][a1.h-1]) < margChar &&
-							((range1 < margChar && gridDiffFast(a1, a2, margChar, crossRange) < uint32(margChar)*uint32(a1.w)*uint32(a1.h)) || (range1 >= margChar && gridDiffMax(a1, a2, margChar) < margChar))) {
+						if crossRange < margChar || ((edgeW >= 15 || edgeH >= 15 || (edgeW+1)*(edgeH+1) > 16) && lumaCornerCheck(corner1, corner2, corner3, corner4, cornerA, cornerB, a1.maxLuma-a1.minLuma, a1, a2, margChar, areaMarg, crossRange, edgeW, edgeH)) || (edgeW < 15 && edgeH < 15 && (edgeW+1)*(edgeH+1) <= 16 && rangeMaxCheck(a1.maxLuma-a1.minLuma, a1, a2, margChar, areaMarg, crossRange)) {
 							if rand.Uint32()%2 != 0 {
-								bool1 &= (^(1 << uint8(i)))
+								bool1 &= (^(1 << i))
+								k1--
 							} else {
-								bool2 &= (^(1 << uint8(j)))
+								bool2 &= (^(1 << j))
+								k2--
+								for u2 < 8 && bool2&(1<<u2) == 0 {
+									u2++
+								}
 							}
 						}
 					}
 				}
 			}
-			if bool2>>j != 0 && (bool1>>i)%2 != 0 {
+			if bool2>>j != 0 && bool1&(1<<i) != 0 {
 				j++
+				cursor2_mod++
 			} else {
-				j = 255
+				j = u2_char
+				cursor2_mod = (cursor2 << 3) + u2
+				i++
+				cursor1_mod++
+				u1 += 255
 			}
-		}
-		if bool1>>i != 0 {
-			i++
-			u1 += 255
 		} else {
-			i = 255
+			i++
+			cursor1_mod++
+		}
+	}
+	if k1 == 1 {
+		cursor1_mod = cursor1 << 3
+		for u1 < 8 && bool1&(1<<uint8(u1)) == 0 {
+			u1++
+			cursor1_mod++
+		}
+		if cursor1_mod < uint32(len(array)) {
+			nonet := compareSingleToOctet(array, margin, bool2, cursor2, u2, v2, array[cursor1_mod])
+			return ((nonet >> 8) * uint16(bool1)) + ((nonet % 256) << 8)
+		}
+	} else if k2 == 1 {
+		cursor2_mod = cursor2 << 3
+		u2_char = 0
+		for u2_char < 8 && bool2&(1<<u2_char) == 0 {
+			u2_char++
+			cursor2_mod++
+		}
+		if cursor2_mod < uint32(len(array)) {
+			nonet := compareSingleToOctet(array, margin, bool1, cursor1, u1, v1, array[cursor2_mod])
+			return ((nonet >> 8) * (uint16(bool2) << 8)) + (nonet % 256)
 		}
 	}
 	/*Return both octets back as 16-bit value.*/
@@ -673,47 +944,117 @@ func lastSet(octet uint8, u uint8) uint8 {
 	return v
 }
 
+func twoSingles(g1 Grid, g2 Grid, margChar uint8, bool1 uint8, bool2 uint8, ka int) (uint8, uint8, int) {
+	crossRange := getCrossRange(g1, g2)
+	range1 := g1.maxLuma - g1.minLuma
+	range2 := g2.maxLuma - g2.minLuma
+	if crossRange < margChar || (((range1 < margChar && range2 < margChar) || (range1 >= margChar && range2 >= margChar)) && (g1.w < 16 && g1.h < 16 && g1.w*g1.h <= 16 || maxCornerDiff(g1, g2, margChar) < margChar) && rangeMaxCheck(range1, g1, g2, margChar, uint32(g1.w)*uint32(g1.h)*uint32(margChar), crossRange)) {
+		if rand.Uint32()%2 != 0 {
+			return 0, bool2, 0
+		} else {
+			return bool1, 0, ka
+		}
+	}
+	return bool1, bool2, ka
+}
+
+func firstSetSafe(octet uint8, arrayLen uint32, i uint32) uint8 {
+	u := firstSet(octet)
+	for u > 0 && ((octet>>u)%2 == 0 || (i<<3)+uint32(u) >= arrayLen) {
+		u--
+	}
+	return u
+}
+
+func lastSetSafe(octet uint8, arrayLen uint32, i uint32, u uint8, array []Grid, g Grid, margChar uint8, comp bool) uint8 {
+	v := lastSet(octet, u+1)
+	/*The loop can end if v2 is in bounds, it corresponds to a set bit, and the grid it references
+	is comparable to gv.*/
+	for v > u+1 && ((i<<3)+uint32(v)-1 > arrayLen || octet>>(v-1) != 0 || (!comp || !comparableGrids(array[(i<<3)+uint32(v)], g, margChar))) {
+		v--
+	}
+	return v
+}
+
+/*
+This uses Kernighan's algorithm on a subset of
+a byte.
+*/
+func kernSubset(bbyte uint8, u uint8, v uint8) int {
+	if v < 8 {
+		return kern((bbyte % (1 << v)) >> u)
+	}
+	return kern(bbyte >> u)
+}
+
 /*This is the intermediary between removeRedundantGrids and compareGridBool.*/
 func compareDoubles(boolArray []uint8, a uint32, b uint32, array []Grid, u1 uint32, v1 uint32, margin float64) {
+	/*In case the first remaining grid in the first octet is
+	substanially different than the last in the same octet*/
+	for u1 < v1-1 && (array[(a<<3)+u1].h != array[(a<<3)+v1-1].h || array[(a<<3)+u1].w != array[(a<<3)+v1-1].w || byteAbsDiff(array[((a+1)<<3)].avgLuma, array[(a<<3)+v1-1].avgLuma) > uint8(256.0*margin)) {
+		u1++
+	}
 	margChar := uint8(margin * 256.0)
 	gv := array[(a<<3)+(v1-1)]
-	for i := a + 1; boolArray[a] != 0 && i < b; i++ {
+	arrayLen := uint32(len(array))
+	ka := kernSubset(boolArray[a], uint8(u1), uint8(v1))
+	for i := a + 1; ka != 0 && i < b; i++ {
 		if boolArray[i] != 0 {
-			u2 := uint32(firstSet(boolArray[i]))
-			for u2 > 0 && (i<<3)+u2 >= uint32(len(array)) {
-				u2--
-			}
-			for u2 > 0 && (boolArray[i]>>uint8(u1))%2 == 0 {
-				u2--
-			}
-			if array[(i<<3)+u2].h == gv.h && array[(i<<3)+u2].w == gv.w && array[(i<<3)+u2].avgLuma-gv.avgLuma < margChar {
-				v2 := u2 + 1
-				for v2 < 8 && boolArray[i]>>uint8(v2) == 1 && array[(i<<3)+v2].h == gv.h && array[(i<<3)+v2].w == gv.w {
-					v2++
-				}
-				doublet := compareGridBool(array, margin, a, i, boolArray[a], boolArray[i], u1, v2, u2, v2)
-				newA := uint8(doublet % 256)
-				if newA != boolArray[a] {
-					if newA != 0 {
-						u1 := uint32(firstSet(newA))
-						for u1 > 0 && (a<<3)+u1 >= uint32(len(array)) {
-							u1--
+			u2 := firstSetSafe(boolArray[i], arrayLen, i)
+			u2_32 := uint32(u2)
+			/*This will almost certainly be true, but in case it
+			isn't, simply do not execute the loop further.*/
+			if comparableGrids(array[(i<<3)+uint32(u2)], gv, margChar) {
+				v2 := uint32(lastSetSafe(boolArray[i], arrayLen, i, u2, array, gv, margChar, true))
+				ki := kernSubset(boolArray[i], u2, uint8(v2))
+				/*If there is at least one remaining grid in both octets*/
+				if ki != 0 && ka != 0 {
+					/*If there are multiple remaining grids in both octets*/
+					if ki > 1 && ka > 1 {
+						var doublet uint16
+						/*If the grids in the octets have an area 16 or below*/
+						if gv.w < 16 && gv.h < 16 && gv.w*gv.h <= 16 {
+							doublet = compareGridBoolSub16(array[(a*8):(a+1)*8], array[(i*8):minUint32((i+1)*8, arrayLen)], margin, boolArray[a], boolArray[i], uint8(u1), uint8(v1), u2, uint8(v2))
+							/*Otherwise*/
+						} else {
+							doublet = compareGridBool(array, margin, a, i, boolArray[a], boolArray[i], u1, v1, u2_32, v2)
 						}
-						for u1 > 0 && (newA>>uint8(u1))%2 == 0 {
-							u1--
+						/*This checks if the first octet was altered.*/
+						newA := uint8(doublet % 256)
+						if newA != boolArray[a] {
+							if newA != 0 {
+								u1 = uint32(firstSetSafe(newA, arrayLen, i))
+								v1 = uint32(lastSetSafe(newA, arrayLen, a, uint8(u1), array, gv, margChar, false))
+								gv = array[(a<<3)+(v1-1)]
+								ka = kernSubset(boolArray[a], uint8(u1), uint8(v1))
+							} else {
+								ka = 0
+							}
+							boolArray[a] = newA
 						}
-						v1 = uint32(lastSet(newA, uint8(u1)+1))
-						for v1 > u1 && (a<<3)+(v1-1) >= uint32(len(array)) {
-							v1--
+						boolArray[i] = uint8(doublet >> 8)
+					} else {
+						/*If there is only one remaining octet in both*/
+						if ka == 1 && ki == 1 {
+							boolArray[a], boolArray[i], ka = twoSingles(array[(a<<3)+u1], array[(i<<3)+u2_32], margChar, boolArray[a], boolArray[i], ka)
+							/*If the second only has one remaining octet*/
+						} else if ki == 1 {
+							nonet := compareSingleToOctet(array, margin, boolArray[a], a, u2_32, v2, array[(i<<3)+u2_32])
+							if nonet < 256 {
+								boolArray[i] = 0
+							}
+							boolArray[a] = uint8(nonet % 256)
+							/*If the first only has one remaining octet*/
+						} else {
+							nonet := compareSingleToOctet(array, margin, boolArray[i], i, u2_32, v2, array[(a<<3)+u1])
+							if nonet < 256 {
+								boolArray[a] = 0
+								ka = 0
+							}
+							boolArray[i] = uint8(nonet % 256)
 						}
-						for v1 > u1 && (newA>>uint8(v1-1))%2 == 0 {
-							v1--
-						}
-						gv = array[(a<<3)+(v1-1)]
 					}
-					boolArray[a] = newA
 				}
-				boolArray[i] = uint8(doublet >> 8)
 			}
 		}
 	}
@@ -833,8 +1174,25 @@ func restructuredBoolArray(boolArray []uint8, boolLen uint32, array []Grid, arra
 	}
 }
 
+func compareSingle(array []Grid, arrayLen uint32, cursor uint32, octet uint8, margin float64) uint8 {
+	u := uint32(firstSet(octet))
+	for u > 0 && (((cursor*8)+u) >= arrayLen || (octet>>uint8(u))%2 == 0) {
+		u--
+	}
+	if (octet>>uint8(u))%2 == 1 {
+		v := uint32(lastSet(octet, uint8(u+1)))
+		for v > u && (((cursor*8)+v-1) >= arrayLen || (octet>>uint8(v-1))%2 == 0) {
+			v--
+		}
+		if (octet>>uint8(v-1))%2 == 1 && v > u+1 {
+			octet = compareGridBoolSingle(array, margin, cursor, octet, u, v)
+		}
+	}
+	return octet
+}
+
 /*This eliminates grids that are similar within a margin.*/
-func removeRedundantGrids(array []Grid, margin float64) []Grid {
+func removeRedundantGrids(array []Grid, margin float64, tNum uint32) []Grid {
 	arrayLen := uint32(len(array))
 	margInt := uint8(margin * 256.0)
 
@@ -853,98 +1211,66 @@ func removeRedundantGrids(array []Grid, margin float64) []Grid {
 		boolArray[boolLen-1] = uint8((1 << (arrayLen % 8)) - 1)
 	}
 
-	/*Every byte is internally compared, and bits are unset if they
-	correspond to a grid that is too similar to a previous grid.
-	Afterwards, each remaining grid described by the bit is compared
-	to all subsequent grids of the same dimensions and similar
-	average brightness level, unsetting bits if necessary. This ensures
-	no pair of grids is compared twice.*/
-	for i := uint32(0); i < boolLen; i++ {
-		/*Tell the user how much of the array has been examined.*/
-		if 1000000000 < time.Now().UnixNano()-start {
-			fmt.Printf("%f%%\n", 100.0*float64(i)/float64(arrayLen>>3))
-			start = time.Now().UnixNano()
+	/*Perform single-octet comparison through the whole array.*/
+	for i := uint32(0); i < boolLen; i += tNum {
+		wg.Add(int(tNum))
+		for j := uint32(0); j < tNum; j++ {
+			go func(j uint32) {
+				defer wg.Done()
+				if i+j < boolLen {
+					boolArray[i+j] = compareSingle(array, arrayLen, i+j, boolArray[i+j], margin)
+				}
+			}(j)
 		}
-
-		/*If an octet still has at least two remaining grids*/
-		if boolArray[i] != 0 && kern(boolArray[i]) > 1 {
-
-			/*Find its first grid, and dial it back if, for
-			whatever reason, the initial search went out of
-			bounds.*/
-			u := uint32(firstSet(boolArray[i]))
-			for u > 0 && (i<<3)+u >= arrayLen {
-				u--
-			}
-			for u > 0 && (boolArray[i]>>u)%2 == 0 {
-				u--
-			}
-
-			/*If the search did not go out of bounds*/
-			if (boolArray[i]>>u)%2 == 1 {
-				/*Find the cursor after the last set bit, and adjust
-				if it went out of bounds.*/
-				v := uint32(lastSet(boolArray[i], uint8(u+1)))
-				for v > 1 && (i<<3)+(v-1) >= arrayLen {
-					v--
-				}
-				for v > 1 && (boolArray[i]>>(v-1))%2 == 0 {
-					v--
-				}
-
-				/*If the above search did not go out of bounds*/
-				if (boolArray[i]>>(v-1))%2 == 1 {
-					/*If the octet has at least two remaining grids, compare within the octet, and readjust
-					the bounds if necessary.*/
-					if v > u+1 {
-						boolArray[i] = compareGridBoolSingle(array, margin, i, boolArray[i], u, v)
-						if (boolArray[i]>>u)%2 == 0 {
-							u = uint32(firstSet(boolArray[i]))
-							for u > 0 && (i<<3)+u >= arrayLen {
-								u--
-							}
-							for u > 0 && (boolArray[i]>>u)%2 == 0 {
-								u--
-							}
-						}
-						if (boolArray[i]>>(v-1))%2 == 0 {
-							v = uint32(lastSet(boolArray[i], uint8(u+1)))
-							for v > u && (i<<3)+(v-1) >= arrayLen {
-								v--
-							}
-							for v > u && (boolArray[i]>>(v-1))%2 == 0 {
-								v--
-							}
-						}
-					}
-					/*Unlike comparing within a single octet, comparison across
-					octets does not require any of them have multiple grids
-					remaining.*/
-					gv := array[(i<<3)+(v-1)]
-					var j uint32
-					/*Find the last grid "in reach" of the last one in the current octet.*/
-					if gv.avgLuma >= 255-margInt {
-						j = mostComparableCursor(array, i<<3, arrayLen, gv.w, gv.h, 255)
-					} else {
-						j = mostComparableCursor(array, i<<3, arrayLen, gv.w, gv.h, gv.avgLuma+margInt)
-					}
-					j >>= 3
-
-					/*Decrement if the search went out of bounds or it landed on an octet
-					whose grids have all been eliminated.*/
-					for j >= boolLen || (boolArray[j] == 0 && j > i+1) {
-						j--
-					}
-
-					/*If at least octet has at least one grid that is comparable to at least
-					one in the current octet, make comparisons.*/
-					if j > i+1 {
-						compareDoubles(boolArray, i, j, array, u, v, margin)
-					}
-				}
-			}
-		}
+		wg.Wait()
 	}
+	for i := uint32(0); i < tNum; i++ {
+		wg.Add(1)
+		go func(i uint32) {
+			defer wg.Done()
+			/*Endpoints for the multithreaded part.*/
+			end1 := i * boolLen / tNum
+			end2 := (i + 1) * boolLen / tNum
+			if end2 > boolLen {
+				end2 = boolLen
+			}
+			for j := end1; j < end2; j++ {
+				/*First set bit of current octet*/
+				u := uint32(firstSet(boolArray[j]))
+				for u > 0 && (((j*8)+u) >= arrayLen || (boolArray[j]>>uint8(u))%2 == 0) {
+					u--
+				}
+				/*In case something goes haywire.*/
+				if boolArray[j]&(1<<uint8(u)) != 0 {
+					v := uint32(lastSet(boolArray[i], uint8(u+1)))
+					for v > u+1 && (((j*8)+v-1) >= arrayLen || (boolArray[j]>>uint8(v-1))%2 == 0) {
+						v--
+					}
+					gv := array[(j<<3)+(v-1)]
+					var k uint32
+
+					/*Finding the last octet with comparable grids*/
+					if gv.avgLuma >= 255-margInt {
+						k = mostComparableCursor(array, j<<3, arrayLen, gv.w, gv.h, 255)
+					} else {
+						k = mostComparableCursor(array, j<<3, arrayLen, gv.w, gv.h, gv.avgLuma+margInt)
+					}
+					k >>= 3
+
+					/*Finding which actually has remaining grids*/
+					for k >= boolLen || (boolArray[k] == 0 && k > j+1) {
+						k--
+					}
+
+					if k > j+1 {
+						compareDoubles(boolArray, j, k, array, u, v, margin)
+					}
+				}
+			}
+		}(i)
+
+	}
+	wg.Wait()
 
 	/*Shuffle around the grids so that all the remaining ones are at
 	the beginning and all eliminated ones are at the end.*/
@@ -976,14 +1302,13 @@ func gridFromImg(img [][]uint8, x1 uint32, x2 uint32, y1 uint32, y2 uint32) Grid
 	w32 := uint32(w)
 
 	g := Grid{
-		w:       w,
-		h:       h,
-		avgLuma: 0,
-		medLuma: 0,
-		maxLuma: 0,
-		minLuma: 255,
-		array:   make([][]uint8, w),
-		sum:     0,
+		w:     w,
+		h:     h,
+		array: make([][]uint8, w),
+	}
+
+	for i := range g.array {
+		g.array[i] = make([]uint8, h)
 	}
 
 	maxLuma := uint8(0)
@@ -994,7 +1319,6 @@ func gridFromImg(img [][]uint8, x1 uint32, x2 uint32, y1 uint32, y2 uint32) Grid
 	it is higher or lower than previous pixels, add
 	it to the sum, and then place it into the grid.*/
 	for i := uint32(0); i < w32; i++ {
-		g.array[i] = make([]uint8, h)
 		for j := uint32(0); j < h32; j++ {
 			p := img[x1+i][y1+j]
 			if p > maxLuma {
@@ -1066,6 +1390,7 @@ func gridsFromCoords(img [][][]uint8, trees []*Tree) []Grid {
 	/*Create and populate the grid array based on the coordinates*/
 	gridArray := make([]Grid, totalLeafNum)
 	tempLeafNum = 0
+	start = time.Now().UnixNano()
 	for i := 0; i < len(img); i++ {
 		leafNum := uint32(trees[i].leafNum)
 		for j := uint32(0); j < leafNum; j++ {
@@ -1388,11 +1713,11 @@ func writeToFile(array []Grid, arrayLen uint32, fName string) error {
 }
 
 /*Combine two arrays.*/
-func combineArrays(array1 []Grid, array2 []Grid, margin float64) []Grid {
+func combineArrays(array1 []Grid, array2 []Grid, margin float64, tNum uint32) []Grid {
 	array1 = append(array1, array2...)
 	sort.Slice(array1, func(i, j int) bool { return lessGrid(array1[i], array1[j], false) })
 	start = time.Now().UnixNano()
-	array1 = removeRedundantGrids(array1, margin)
+	array1 = removeRedundantGrids(array1, margin, tNum)
 	return array1
 }
 
@@ -1413,6 +1738,14 @@ func openImage(path string) (image.Image, error) {
 		}
 		return pngImg, err
 	}
+	/*if strings.HasSuffix(strings.ToLower(path), ".jpg") || strings.HasSuffix(strings.ToLower(path), ".jpeg") {
+		pngImg, err := png.Decode(f)
+		if err != nil {
+			log.Fatal(err)
+			return nil, err
+		}
+		return pngImg, err
+	}*/
 	img, _, err := image.Decode(f)
 	if err != nil {
 		fmt.Println("Decoding error: ", err.Error())
@@ -1427,24 +1760,15 @@ func convertToGrayscale(img image.Image, w int, h int) [][]uint8 {
 	for x := 0; x < w; x++ {
 		mono[x] = make([]uint8, h)
 	}
-	/*Simply drop in the grayscale values for an image that is
-	already monochrome.*/
-	if grayImg, ok := img.(*image.Gray); ok {
-		for x := 0; x < w; x++ {
-			for y := 0; y < h; y++ {
-				mono[x][y] = grayImg.GrayAt(x, y).Y
-			}
-		}
-	} else {
-		/*Use basic color math to generate grayscale values*/
-		for x := 0; x < w; x++ {
-			for y := 0; y < h; y++ {
-				r, g, b, _ := img.At(x, y).RGBA()
-				r >>= 8
-				g >>= 8
-				b >>= 8
-				mono[x][y] = grayscale(uint8(r), uint8(g), uint8(b))
-			}
+	var grayImg *image.Gray
+	var ok bool
+	if grayImg, ok = img.(*image.Gray); !ok {
+		grayImg = image.NewGray(img.Bounds())
+		draw.Draw(grayImg, grayImg.Bounds(), img, img.Bounds().Min, draw.Src)
+	}
+	for x := 0; x < w; x++ {
+		for y := 0; y < h; y++ {
+			mono[x][y] = grayImg.GrayAt(x, y).Y
 		}
 	}
 	return mono
@@ -1559,6 +1883,7 @@ func main() {
 	lArray := make([]string, 0)
 	yArray := make([]string, 0)
 	oArray := make([]string, 0)
+	tArray := make([]string, 0)
 	array := make([]Grid, 0)
 	var arrayLen uint32
 	args := os.Args
@@ -1613,6 +1938,13 @@ func main() {
 			fmt.Println("e.g.	(-i or -l option) -k newDataSet")
 			fmt.Println("The original purpose of this program was to make digitally-created images appear hand-drawn. However, it can be used for texturing of any kind.")
 			return
+		} else if args[i] == "-t" {
+			j := i + 1
+			for j < len(args) && args[j][0] != 45 {
+				tArray = append(tArray, args[j])
+				j++
+			}
+			i = j - 1
 		}
 	}
 	/*These handle discoordinate arguments and arguments with an incorrect number of
@@ -1662,6 +1994,27 @@ func main() {
 		fmt.Println("Please specify at least one base image file, minimum and maximum grid dimensions, in that exact order.")
 		return
 	}
+	if len(tArray) > 1 {
+		fmt.Println("Please specify one argument for thread number.")
+		return
+	}
+	/*This handles inputting one or more file containing a grid array.*/
+	tNum := uint64(1)
+	var errT error
+	if len(tArray) == 1 {
+		tNum, errT = strconv.ParseUint(tArray[0], 10, 8)
+		if errT != nil {
+			fmt.Println("Please specify an integer for thread number")
+			log.Fatal(err)
+			return
+		}
+		if tNum < 1 {
+			fmt.Println("Please specify a positive integer for thread number")
+			return
+		}
+		fmt.Printf("Thread num: %d\n", tNum)
+	}
+
 	if len(lArray) > 0 {
 		fmt.Println("Adding data from " + lArray[0])
 		arrayTemp, err := readFromFile(lArray[0])
@@ -1703,7 +2056,7 @@ func main() {
 						arrayLen--
 					}
 				}
-				array = combineArrays(array, arrayTemp, margin)
+				array = combineArrays(array, arrayTemp, margin, uint32(tNum))
 				n1 := uint32(0)
 				n2 := uint32(len(array))
 				var m uint32
@@ -1746,22 +2099,30 @@ func main() {
 		imgArray := make([][][]uint8, len(iArray)-3)
 		trees := make([]*Tree, len(iArray)-3)
 		monoTime := int64(0)
-		for i := 0; i < len(iArray)-3; i++ {
-			monoStart := time.Now().UnixNano()
-			img, err := openImage(iArray[i])
-			if nil != err {
-				fmt.Println("Please specify valid filenames for all input images.")
-				log.Fatal(err)
-				return
+		for i := 0; i < len(iArray)-3; i += int(tNum) {
+			wg.Add(int(tNum))
+			for j := 0; j < int(tNum); j++ {
+				go func(j int) {
+					defer wg.Done()
+					if i+j < len(iArray)-3 {
+						monoStart := time.Now().UnixNano()
+						img, err := openImage(iArray[i+j])
+						if nil != err {
+							fmt.Println("Please specify valid filenames for all input images.")
+							log.Fatal(err)
+							return
+						}
+						fmt.Printf("Reading %s\n", iArray[i+j])
+						imgBnd := img.Bounds()
+						w := imgBnd.Max.X
+						h := imgBnd.Max.Y
+						imgArray[i+j] = convertToGrayscale(img, w, h)
+						monoTime += (time.Now().UnixNano() - monoStart)
+						trees[i+j] = generateTree(0, uint32(w), 0, uint32(h), uint8(minIn), uint8(maxIn))
+					}
+				}(j)
 			}
-			fmt.Printf("Reading %s\n", iArray[i])
-			imgBnd := img.Bounds()
-			w := imgBnd.Max.X
-			h := imgBnd.Max.Y
-			imgArray[i] = convertToGrayscale(img, w, h)
-			monoTime += (time.Now().UnixNano() - monoStart)
-			trees[i] = generateTree(0, uint32(w), 0, uint32(h), uint8(minIn), uint8(maxIn))
-			start = time.Now().UnixNano()
+			wg.Wait()
 		}
 		fmt.Printf("Time taken to intercept and decolorize images: ")
 		printTime(monoTime)
@@ -1777,7 +2138,7 @@ func main() {
 		if margin > 0 {
 			fmt.Println("Removing redundant grids")
 			start = time.Now().UnixNano()
-			array = removeRedundantGrids(array, margin)
+			array = removeRedundantGrids(array, margin, uint32(tNum))
 			n1 := uint32(0)
 			n2 := uint32(len(array))
 			var m uint32
@@ -1822,7 +2183,7 @@ func main() {
 		foundExt := int8(0)
 		if len(yArray) == 3 {
 			for i := 0; i < cifLength; i++ {
-				if strings.HasSuffix(strings.ToUpper(oArray[0]), fmt.Sprintf("%s%s", ".", commonImageFormats[i])) {
+				if strings.HasSuffix(strings.ToUpper(oArray[i]), fmt.Sprintf("%s%s", ".", commonImageFormats[i])) {
 					foundExt += 1
 					break
 				}
