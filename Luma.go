@@ -386,7 +386,7 @@ func gridDiffFast(g1 Grid, g2 Grid, maxDiff uint8, crossRange uint8) uint32 {
 			w32++
 			h32++
 			i = h32
-			for i < area-1 && sum < maxSum && sum+(area-(2*h32)-i) > maxSum {
+			for i < area-h32 && sum < maxSum && sum+(area-(2*h32)-i) > maxSum {
 				pixel1 = g1.array[i/h32][i%h32]
 				pixel2 = g2.array[i/h32][i%h32]
 				sum += uint32(byteAbsDiff(pixel1, pixel2))
@@ -639,7 +639,12 @@ func rangeMaxCheck(r uint8, a1 Grid, a2 Grid, margChar uint8, areaMarg uint32, c
 This takes a predefined set of corners into account (unless the grids have
 an area 16 or below), and if similar executes the above check.
 */
-func lumaCornerCheck(corner1 uint8, corner2 uint8, corner3 uint8, corner4 uint8, cornerA uint8, cornerB uint8, range1 uint8, a1 Grid, a2 Grid, margChar uint8, areaMarg uint32, crossRange uint8, edgeW uint8, edgeH uint8) bool {
+func lumaCornerCheck(corner1 uint8, corner2 uint8, corner3 uint8, corner4 uint8, cornerA uint8, cornerB uint8, range1 uint8, a1 Grid, a2 Grid, margChar uint8, areaMarg uint32, crossRange uint8) bool {
+	if a1.h != a2.h || a1.w != a2.w {
+		return false
+	}
+	edgeW := a1.w-1
+	edgeH := a1.h-1
 	return (cornerB > 255-margChar || a2.minLuma < cornerB+margChar) &&
 		(cornerA < margChar || a2.maxLuma > cornerA-margChar) &&
 		((a1.w < 16 && a1.h < 16 && a1.w*a1.h <= 16) || (byteAbsDiff(corner1, a2.array[0][0]) < margChar &&
@@ -675,7 +680,7 @@ func compareSingleToOctet(array []Grid, margin float64, octet uint8, cursor uint
 			range2 := f.maxLuma - f.minLuma
 			if ((range1 < margChar && range2 < margChar) || (range1 >= margChar && range2 >= margChar)) && byteAbsDiff(f.avgLuma, g.avgLuma) < margChar {
 				crossRange := getCrossRange(g, f)
-				if crossRange < margChar || lumaCornerCheck(corner1, corner2, corner3, corner4, cornerA, cornerB, range1, g, f, margChar, areaMarg, crossRange, edgeW, edgeH) {
+				if crossRange < margChar || lumaCornerCheck(corner1, corner2, corner3, corner4, cornerA, cornerB, range1, g, f, margChar, areaMarg, crossRange) {
 					/*If the coin-toss removes a grid from the octet, its
 					corresponding bit is unset, like in other functions.
 					If it removes the single grid, the function returns
@@ -867,7 +872,7 @@ func compareGridBool(array []Grid, margin float64, cursor1 uint32, cursor2 uint3
 						crossRange := getCrossRange(a1, a2)
 						/*Same rules apply as in compareGridBoolSingle to determine
 						whether either should be eliminated.*/
-						if crossRange < margChar || ((edgeW >= 15 || edgeH >= 15 || (edgeW+1)*(edgeH+1) > 16) && lumaCornerCheck(corner1, corner2, corner3, corner4, cornerA, cornerB, a1.maxLuma-a1.minLuma, a1, a2, margChar, areaMarg, crossRange, edgeW, edgeH)) || (edgeW < 15 && edgeH < 15 && (edgeW+1)*(edgeH+1) <= 16 && rangeMaxCheck(a1.maxLuma-a1.minLuma, a1, a2, margChar, areaMarg, crossRange)) {
+						if crossRange < margChar || ((edgeW >= 15 || edgeH >= 15 || (edgeW+1)*(edgeH+1) > 16) && lumaCornerCheck(corner1, corner2, corner3, corner4, cornerA, cornerB, a1.maxLuma-a1.minLuma, a1, a2, margChar, areaMarg, crossRange)) || (edgeW < 15 && edgeH < 15 && (edgeW+1)*(edgeH+1) <= 16 && rangeMaxCheck(a1.maxLuma-a1.minLuma, a1, a2, margChar, areaMarg, crossRange)) {
 							if rand.Uint32()%2 != 0 {
 								bool1 &= (^(1 << i))
 								k1--
@@ -1194,6 +1199,7 @@ func compareSingle(array []Grid, arrayLen uint32, cursor uint32, octet uint8, ma
 /*This eliminates grids that are similar within a margin.*/
 func removeRedundantGrids(array []Grid, margin float64, tNum uint32) []Grid {
 	arrayLen := uint32(len(array))
+	comparisons_made := uint64(0)
 	margInt := uint8(margin * 256.0)
 
 	/*The set of grids which will remain is expressed in an array of
@@ -1213,6 +1219,10 @@ func removeRedundantGrids(array []Grid, margin float64, tNum uint32) []Grid {
 
 	/*Perform single-octet comparison through the whole array.*/
 	for i := uint32(0); i < boolLen; i += tNum {
+		if 1000000000 < time.Now().UnixNano()-start {
+			fmt.Printf("%f%%\n", 100.0*float64(i)/float64(boolLen))
+			start = time.Now().UnixNano()
+		}
 		wg.Add(int(tNum))
 		for j := uint32(0); j < tNum; j++ {
 			go func(j uint32) {
@@ -1223,6 +1233,7 @@ func removeRedundantGrids(array []Grid, margin float64, tNum uint32) []Grid {
 			}(j)
 		}
 		wg.Wait()
+		comparisons_made += uint64(tNum*28)
 	}
 	for i := uint32(0); i < tNum; i++ {
 		wg.Add(1)
@@ -1251,9 +1262,9 @@ func removeRedundantGrids(array []Grid, margin float64, tNum uint32) []Grid {
 
 					/*Finding the last octet with comparable grids*/
 					if gv.avgLuma >= 255-margInt {
-						k = mostComparableCursor(array, j<<3, arrayLen, gv.w, gv.h, 255)
+						k = mostComparableCursor(array, j<<3, end2, gv.w, gv.h, 255)
 					} else {
-						k = mostComparableCursor(array, j<<3, arrayLen, gv.w, gv.h, gv.avgLuma+margInt)
+						k = mostComparableCursor(array, j<<3, end2, gv.w, gv.h, gv.avgLuma+margInt)
 					}
 					k >>= 3
 
@@ -1264,6 +1275,7 @@ func removeRedundantGrids(array []Grid, margin float64, tNum uint32) []Grid {
 
 					if k > j+1 {
 						compareDoubles(boolArray, j, k, array, u, v, margin)
+						comparisons_made += (64*uint64(arrayLen-j))
 					}
 				}
 			}
