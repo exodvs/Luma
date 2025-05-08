@@ -2,57 +2,72 @@ package main
 
 import (
 	"bufio"
+	"flag"
 	"fmt"
 	"image"
-	"image/color"
-	"image/draw"
+	"slices"
+
 	_ "image/gif"
+
 	_ "image/jpeg"
-	"image/png"
+	"io"
 	"log"
 	"math"
 	"math/rand"
 	"os"
-	"reflect"
 	"regexp"
+	"runtime/pprof"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	fastpng "github.com/amarburg/go-fast-png"
+	"gocv.io/x/gocv"
+
 	_ "golang.org/x/image/bmp"
+
 	_ "golang.org/x/image/tiff"
 )
 
+import "C"
+
 var start = time.Now().UnixNano()
 
-var wg sync.WaitGroup
+//var arraySize = 0
+
+//var wg sync.WaitGroup
+
+var cpuprofile = flag.String("cpuprofile", "", "write cpu profile to file")
+
+/*
+Grids defined below have a variable dimCornAvg, which stores the
+dimensions, corners, and average brightness. It was originally added
+to aid in sorting, but other uses have been found. The following
+global variables suffixed with _64 are ANDed with the dimCornAvg
+value in order to focus on certain aspects without having to
+make array calls or to check several different aspects at onece.
+*/
+var W_64 uint64 = 0xFF00000000000000
+var H_64 uint64 = 0x00FF000000000000
+var DIM_64 uint64 = W_64 | H_64
+var C1_64 uint64 = 0x000000FF00000000
+var C2_64 uint64 = 0x00000000FF000000
+var C3_64 uint64 = 0x0000000000FF0000
+var C4_64 uint64 = 0x000000000000FF00
+var AVG_64 uint64 = 0x0000FF0000000000
+var RAN_64 uint64 = 0x00000000000000FF
 
 /*Absolute difference between two unsigned 8-bit numbers.*/
 func byteAbsDiff(a uint8, b uint8) uint8 {
+	if a == b {
+		return 0
+	}
 	if a > b {
 		return a - b
 	}
 	return b - a
-}
-
-/*
-Max and min functions for two unsigned 32-bit integers,
-used to correct errant shades of gray to solve a blotching
-problem during colorization process.
-*/
-func maxUint32(a uint32, b uint32) uint32 {
-	if a > b {
-		return a
-	}
-	return b
-}
-func minUint32(a uint32, b uint32) uint32 {
-	if a < b {
-		return a
-	}
-	return b
 }
 
 /*
@@ -66,14 +81,6 @@ func absInt(x int) int {
 	return x
 }
 
-/*Converts rgb values to grayscale*/
-func grayscale(r_ uint8, g_ uint8, b_ uint8) uint8 {
-	gr := 0.2126 * ((float64)(r_))
-	gr += (0.7152 * ((float64)(g_)))
-	gr += (0.0722 * ((float64)(b_)))
-	return (uint8)(gr)
-}
-
 /*
 A struct for a grid, containing a width, height, and an array of
 gray pixels. It also keeps track of the highest, lowest, and
@@ -82,113 +89,28 @@ but the sorting involved was time-consuming and of limited
 utility.
 */
 type Grid struct {
-	w       uint8
-	h       uint8
+	w__     uint8
+	h__     uint8
 	avgLuma uint8
 	medLuma uint8
 	maxLuma uint8
 	minLuma uint8
-	array   [][]uint8
-	sum     uint8
+	//array      [][]uint8
+	sum        uint8
+	coord      uint64
+	dimCornAvg uint64 /*DIMensions, CORNers, AVeraGE, used for sorting and other purposes*/
+	corners    uint32
+	offset     int
+	maxLoc     int
+	minLoc     int
 }
 
-/*
-This sets the average values of a Grid, usually upon
-instantiation.
-*/
-func (g *Grid) resetLuma() {
-	//arrayCopy := make([]uint8, g.w*g.h)
-	var sum uint32
-	var i, j uint8
-	g.maxLuma = 0
-	g.minLuma = 255
-	for i = 0; i < g.w; i++ {
-		for j = 0; j < g.h; j++ {
-			if g.array[i][j] > g.maxLuma {
-				g.maxLuma = g.array[i][j]
-			}
-			if g.array[i][j] < g.minLuma {
-				g.minLuma = g.array[i][j]
-			}
-			//arrayCopy[(i*g.h)+j] = g.array[i][j]
-			sum += (uint32)(g.array[i][j])
-		}
-	}
-	/*Here lie the remains of a process that calculated
-	the median luma.*/
-	//sort.Slice(arrayCopy, func(i, j int) bool { return arrayCopy[i] < arrayCopy[j] })
-	//g.medLuma = (uint8)(arrayCopy[g.h*g.w/2])
-	g.avgLuma = (uint8)(sum / ((uint32)(g.h) * (uint32)(g.w)))
+func (g Grid) getW() uint8 {
+	return g.w__
 }
 
-/*
-This returns whether one grid is "less than" another grid for the
-purposes of sorting. Hierarchy is width, height, average brightness,
-range of brightness levels, max brightness, and min brightness. There
-is also an option to look for the first different corresponding
-pixels between two grids if they otherwise would be sorted together.
-This is not currently used, because this was one of the more substantial
-bottlenecks of the program.
-*/
-func lessGrid(g1 Grid, g2 Grid, perPixel bool) bool {
-	if g1.w < g2.w {
-		return true
-	}
-	if g1.w > g2.w {
-		return false
-	}
-
-	if g1.h < g2.h {
-		return true
-	}
-	if g1.h > g2.h {
-		return false
-	}
-
-	if g1.avgLuma < g2.avgLuma {
-		return true
-	}
-	if g1.avgLuma > g2.avgLuma {
-		return false
-	}
-
-	range1 := g1.maxLuma - g1.minLuma
-	range2 := g2.maxLuma - g2.minLuma
-
-	if range1 < range2 {
-		return true
-	}
-	if range2 < range1 {
-		return false
-	}
-
-	if g1.maxLuma < g2.maxLuma {
-		return true
-	}
-	if g2.maxLuma < g1.maxLuma {
-		return false
-	}
-
-	if g1.minLuma < g2.minLuma {
-		return true
-	}
-	if g2.minLuma < g1.minLuma {
-		return false
-	}
-
-	if perPixel {
-		for i_ := uint8(0); i_ < g1.w; i_++ {
-			for j_ := uint8(0); j_ < g1.h; j_++ {
-				if g1.array[i_][j_] < g2.array[i_][j_] {
-					return true
-				}
-				if g1.array[i_][j_] > g2.array[i_][j_] {
-					return false
-				}
-			}
-		}
-	}
-	return false
+func (g Grid) getH() uint8 {
+	return g.h__
 }
 
 /*
@@ -198,12 +120,10 @@ children. This is used to determine fragments of images to be turned into
 grids.
 */
 type Tree struct {
-	x1          uint32
-	x2          uint32
-	y1          uint32
-	y2          uint32
-	minValid    uint8
-	maxValid    uint8
+	x1          uint64
+	x2          uint64
+	y1          uint64
+	y2          uint64
 	hasChildren uint8
 	lTree       *Tree
 	rTree       *Tree
@@ -211,35 +131,43 @@ type Tree struct {
 }
 
 /*This is a recursive instantiation method for a tree.*/
-func generateTree(x1In uint32, x2In uint32, y1In uint32, y2In uint32, minIn uint8, maxIn uint8) *Tree {
+func generateTree(x1In uint64, x2In uint64, y1In uint64, y2In uint64, minIn uint64, maxIn uint64, rBits uint64, rBytes uint64) *Tree {
 	t := Tree{
 		x1:          x1In,
 		x2:          x2In,
 		y1:          y1In,
 		y2:          y2In,
-		minValid:    minIn,
-		maxValid:    maxIn,
 		hasChildren: 0,
 		leafNum:     0,
 	}
-	if t.x2-t.x1 > uint32(maxIn) && (t.y2-t.y1 <= uint32(maxIn) || rand.Uint32()%2 != 1) {
-		mid := (t.x1 + uint32(t.minValid)) + (rand.Uint32() % (t.x2 - t.x1 - (2 * uint32(t.minValid))))
-		for mid-t.x1 < uint32(t.minValid) || t.x2-mid < uint32(t.minValid) {
-			mid = (t.x1 + uint32(t.minValid)) + (rand.Uint32() % (t.x2 - t.x1 - uint32(t.minValid)))
-		}
+	/*This determines which axis is divided if both are above the maximum allowable dimensions*/
+	for rBits == 0 {
+		rBits = rand.Uint64()
+	}
+	/*This determines the size of a division*/
+	for (rBytes & 0xFFFF) < 2*minIn {
+		rBytes = rand.Uint64()
+	}
+	/*If the horizontal endpoints are greater than the maximum allowed and the vertical is not OR the lowest
+	bit in rBits is 0, subdivide horizontally*/
+	if t.x2-t.x1 > maxIn && (t.y2-t.y1 <= maxIn || rBits%2 == 0) {
+		rBits >>= 1
+		mid := (t.x1 + minIn) + ((rBytes & 0xFFFF) % (t.x2 - t.x1 - (2 * minIn)))
+		rBytes >>= 16
 		t.hasChildren = 3
-		t.lTree = generateTree(t.x1, mid, t.y1, t.y2, t.minValid, t.maxValid)
-		t.rTree = generateTree(mid, t.x2, t.y1, t.y2, t.minValid, t.maxValid)
+		t.lTree = generateTree(t.x1, mid, t.y1, t.y2, minIn, maxIn, rBits, rBytes)
+		t.rTree = generateTree(mid, t.x2, t.y1, t.y2, minIn, maxIn, rBits, rBytes)
 		t.leafNum = t.lTree.leafNum + t.rTree.leafNum
-	} else if t.y2-t.y1 > uint32(maxIn) {
-		mid := (t.y1 + uint32(t.minValid)) + (rand.Uint32() % (t.y2 - t.y1 - (2 * uint32(t.minValid))))
-		for mid-t.y1 < uint32(t.minValid) || t.y2-mid < uint32(t.minValid) {
-			mid = (t.y1 + uint32(t.minValid)) + (rand.Uint32() % (t.y2 - t.y1 - uint32(t.minValid)))
-		}
+		/*If the vertical endpoints are greater than the maximum allowed and the horizontal is not OR the lowest
+		bit in rBits is 1, subdivide verically*/
+	} else if t.y2-t.y1 > maxIn {
+		mid := (t.y1 + minIn) + ((rBytes & 0xFFFF) % (t.y2 - t.y1 - (2 * minIn)))
 		t.hasChildren = 3
-		t.lTree = generateTree(t.x1, t.x2, t.y1, mid, t.minValid, t.maxValid)
-		t.rTree = generateTree(t.x1, t.x2, mid, t.y2, t.minValid, t.maxValid)
+		rBytes >>= 16
+		t.lTree = generateTree(t.x1, t.x2, t.y1, mid, minIn, maxIn, rBits, rBytes)
+		t.rTree = generateTree(t.x1, t.x2, mid, t.y2, minIn, maxIn, rBits, rBytes)
 		t.leafNum = t.lTree.leafNum + t.rTree.leafNum
+		/*If both are within the proper range, set this tree to a leaf*/
 	} else {
 		t.leafNum = 1
 	}
@@ -247,193 +175,239 @@ func generateTree(x1In uint32, x2In uint32, y1In uint32, y2In uint32, minIn uint
 }
 
 /*
-This compares each pixel of two grids, stores their absolute difference, and returns the
-sum.
+Checks if the absolute difference between two grids exceeds a certain maximum value.
+There used to be a "g2," which now is a ghost variable mentioned in the comments to
+make things clearer. The last several parameters refer to what it was, and are acquired
+outside the loop to increase speed.
 */
-func gridDiff(g1 Grid, g2 Grid) uint32 {
-	if g1.w != g2.w || g1.h != g2.h {
-		return math.MaxUint32
-	}
+func gridDiffNaphil(g1 Grid, maxSum uint32, naphilArray1 []uint8, naphilArray2 []uint8, area int, min2 uint8, max2 uint8, start_2 int, end_2 int) uint32 {
 	sum := uint32(0)
-	for i := uint8(0); i < g1.w; i++ {
-		for j := uint8(0); j < g1.h; j++ {
-			sum += uint32(byteAbsDiff(g1.array[i][j], g2.array[i][j]))
+	area_32 := uint32(area)
+	var p1, p2, diff uint8
+	maxDiff_8 := uint8(maxSum / area_32)
+	min1 := g1.minLuma
+	max1 := g1.maxLuma
+	start_1 := g1.offset
+	end_1 := start_1 + area
+	i1 := end_1
+	i2 := end_2
+	/*Edge case, the first grid's pixels all equal each other*/
+	if min1 == max1 {
+		if min2 == max2 {
+			/*Both grids have the same unique value as each other*/
+			if min1 == min2 {
+				return 0
+			}
+			/*g1 is above g2*/
+			if min1 > min2 {
+				return area_32 * uint32(min1-min2)
+			}
+			/*g2 is above g1*/
+			return area_32 * uint32(min2-min1)
 		}
-	}
-	return sum
-}
-
-/*
-This determines if any two corresponding pixels have an absolute difference greater
-than an arbitrarily-define value.
-*/
-func gridDiffMax(g1 Grid, g2 Grid, maxIn uint8) uint8 {
-	if g1.w != g2.w || g1.h != g2.h {
-		return 255
-	}
-	maxDiff := uint8(0)
-	h := uint32(g1.h)
-	w := uint32(g1.w)
-	var c1, c2, flr, clg uint8
-	/*The floor, which is below the maximum value of
-	g2.*/
-	if g2.maxLuma < maxIn {
-		flr = 0
-	} else {
-		flr = g2.maxLuma - maxIn
-	}
-	/*The ceiling, which is above the minimum value of
-	g2.*/
-	if g2.maxLuma > 255-maxIn {
-		clg = 255
-	} else {
-		clg = g2.maxLuma + maxIn
-	}
-	/*If one of the pixels from g1 is below the floor or above the
-	ceiling, it has the potential to be different enough from the
-	corresponding pixel in g2 to satisfy the question this function
-	asks.*/
-	for i := uint32(0); i < w; i++ {
-		for j := uint32(0); j < h; j++ {
-			c1 = g1.array[i][j]
-			if c1 > clg {
-				c2 = g2.array[i][j]
-				if c2 < c1 && c1-c2 > maxIn {
-					return c1 - c2
+		/*The following two scenarios are set apart because they
+		have no risk of bit underflow.*/
+		/*All values in g2 are above g1*/
+		if min2 >= max1 {
+			g1_32 := (uint32(max1) * area_32)
+			maxSum_alt := maxSum + g1_32
+			for i2 > start_2 {
+				i2--
+				sum += uint32(naphilArray2[i2])
+				if sum > maxSum_alt {
+					return sum
 				}
 			}
-			if flr > c1 {
-				c2 = g2.array[i][j]
-				if c2 > c1 && c2-c1 > maxIn {
-					return c2 - c1
+			return sum - g1_32
+		}
+		/*All values in g1 are above g2*/
+		if min1 >= max2 {
+			for i2 > start_2 {
+				i2--
+				sum += uint32(min1 - naphilArray2[i2])
+				if sum > maxSum {
+					return sum
 				}
 			}
+			return sum
 		}
-	}
-	return maxDiff
-}
-
-/*
-This finds the total difference between two grids, but will return early
-under certain conditions.
-*/
-func gridDiffFast(g1 Grid, g2 Grid, maxDiff uint8, crossRange uint8) uint32 {
-	if g1.w != g2.w || g1.h != g2.h {
-		return math.MaxUint32
-	}
-	/*Obviously, if the lowest of one grid is maxDiff above the maximum of the other grid,
-	then all corresponding pixels have a difference greater than or equal to maxDiff.*/
-	if (g2.maxLuma < 255-maxDiff && g1.minLuma > g2.maxLuma+maxDiff) || (g1.maxLuma < 255-maxDiff && g2.minLuma > g1.maxLuma+maxDiff) {
-		return math.MaxUint32
-	}
-	sum := uint32(0)
-	h32 := uint32(g1.h)
-	w32 := uint32(g1.w)
-	area := w32 * h32
-	maxSum := uint32(maxDiff) * area
-	var pixel1, pixel2 uint8
-	i := uint32(0)
-	cr32 := uint32(crossRange)
-	/*If the area is less than or equal to 16, a quarter of the time or more will be spent
-	checking corners. This performs the corner checking followed by the other pixels. Other
-	measures in the program ensure that no corner checking takes places in grids with such
-	dimensions beforehand.*/
-	if area <= 16 {
-		w32--
-		h32--
-		pixel1 = g1.array[0][0]
-		pixel2 = g2.array[0][0]
-		tempDiff := byteAbsDiff(pixel1, pixel2)
-		if tempDiff > maxDiff {
-			return maxSum
-		}
-		sum += uint32(tempDiff)
-		pixel1 = g1.array[0][h32]
-		pixel2 = g2.array[0][h32]
-		tempDiff = byteAbsDiff(pixel1, pixel2)
-		if tempDiff > maxDiff {
-			return maxSum
-		}
-		sum += uint32(tempDiff)
-		pixel1 = g1.array[w32][0]
-		pixel2 = g2.array[w32][0]
-		tempDiff = byteAbsDiff(pixel1, pixel2)
-		if tempDiff > maxDiff {
-			return maxSum
-		}
-		sum += uint32(tempDiff)
-		pixel1 = g1.array[w32][h32]
-		pixel2 = g2.array[w32][h32]
-		tempDiff = byteAbsDiff(pixel1, pixel2)
-		if tempDiff > maxDiff {
-			return maxSum
-		}
-		sum += uint32(tempDiff)
-		/*There is at least one row and one column, along with at least one of their
-		intersections, that will be unexplored by the corner calculation.*/
-		/*Check the right and left columns, and then the middle*/
-		i = 1
-		if sum+((area-4)*cr32) > maxSum {
-			for i < h32 && sum < maxSum && sum+((area-4-(2*i))*cr32) > maxSum {
-				pixel1 = g1.array[0][i]
-				pixel2 = g2.array[0][i]
-				sum += uint32(byteAbsDiff(pixel1, pixel2))
-				pixel1 = g1.array[w32][i]
-				pixel2 = g2.array[w32][i]
-				sum += uint32(byteAbsDiff(pixel1, pixel2))
-				i++
-			}
-			w32++
-			h32++
-			i = h32
-			for i < area-h32 && sum < maxSum && sum+(area-(2*h32)-i) > maxSum {
-				pixel1 = g1.array[i/h32][i%h32]
-				pixel2 = g2.array[i/h32][i%h32]
-				sum += uint32(byteAbsDiff(pixel1, pixel2))
-				i++
+		/*The values in g2 are interspersed above
+		and below g1*/
+		for i2 > start_2 {
+			i2--
+			p2 = naphilArray2[i2]
+			if p2 != max1 {
+				diff = p2 - max1
+				if max1 > p2 {
+					diff = max1 - p2
+				}
+				sum += uint32(diff)
+				if sum > maxSum {
+					return sum
+				}
 			}
 		}
 		return sum
 	}
-	/*The third condition determines if there is still a mathematic possibility for the
-	sum to exceed the maximum designated sum. Maintaining this loop to the end indeed
-	is a tightrope balance, but adding this third condition solved a slowdown issue.*/
-	for i < area && sum < maxSum && sum+((area-i)*cr32) > maxSum {
-		pixel1 = g1.array[i/h32][i%h32]
-		pixel2 = g2.array[i/h32][i%h32]
-		sum += uint32(byteAbsDiff(pixel1, pixel2))
-		i++
+	/*All values in g2 are the same*/
+	if min2 == max2 {
+		/*All values in g1 are above g2*/
+		if min1 >= max2 {
+			g2_32 := (uint32(max2) * area_32)
+			maxSum_alt := maxSum + g2_32
+			for i1 > start_1 {
+				i1--
+				sum += uint32(naphilArray1[i1])
+				if sum > maxSum_alt {
+					return sum
+				}
+			}
+			return sum - g2_32
+		}
+		/*All values in g1 are below g2*/
+		if min2 >= max1 {
+			for i1 > start_1 {
+				i1--
+				sum += uint32(min2 - naphilArray1[i1])
+				if sum > maxSum {
+					return sum
+				}
+			}
+			return sum
+		}
+		/*The values in g1 are interspersed above and below g2*/
+		for i1 != start_1 {
+			i1--
+			p1 = naphilArray1[i1]
+			if p1 > max2 {
+				diff = p1 - max2
+				if max2 > p1 {
+					diff = max2 - p1
+				}
+				sum += uint32(diff)
+				if sum > maxSum {
+					return sum
+				}
+			}
+		}
+		return sum
 	}
-	if i < area && sum < maxSum {
-		return sum + ((area - i) * cr32)
+	/*Edge case, all of the pixel values in g1 are greater than even
+	the highest value in g2*/
+	if min1 >= max2 {
+		/*This value is greater than the allowable difference*/
+		if min1-max2 >= maxDiff_8 {
+			return math.MaxUint32
+		}
+		for i1 > start_1 {
+			i1--
+			i2--
+			p1 = naphilArray1[i1]
+			p2 = naphilArray2[i2]
+			if p1 != p2 {
+				diff = p1 - p2
+				sum += uint32(diff)
+				if sum > maxSum {
+					return sum
+				}
+			}
+		}
+		return sum
 	}
-	return sum
-}
-
-/*
-This performs essentially the same function as above, but does not have
-a mechanism to leave early. Since this is used in the luma trace rather
-than to determine which grids may remain in a dataset, it also lacks
-corner comparison.
-*/
-func gridDiffAlt(g1 Grid, g2 Grid, maxDiff uint8) uint32 {
-	if g1.w != g2.w || g1.h != g2.h {
-		return math.MaxUint32
+	if min2 >= max1 {
+		if min2-max1 >= maxDiff_8 {
+			return math.MaxUint32
+		}
+		for i1 > start_1 {
+			i1--
+			i2--
+			p1 = naphilArray1[i1]
+			p2 = naphilArray2[i2]
+			if p1 != p2 {
+				diff = p2 - p1
+				sum += uint32(diff)
+				if sum > maxSum {
+					return sum
+				}
+			}
+		}
+		return sum
 	}
-	if (g2.maxLuma < 255-maxDiff && g1.minLuma > g2.maxLuma+maxDiff) || (g1.maxLuma < 255-maxDiff && g2.minLuma > g1.maxLuma+maxDiff) {
-		return math.MaxUint32
+	/*The loop is unrolled*/
+	start_l := start_1 + (area % 4)
+	for i1 > start_l {
+		i1--
+		i2--
+		p1 = naphilArray1[i1]
+		p2 = naphilArray2[i2]
+		if p1 != p2 {
+			diff = p1 - p2
+			if p1 < p2 {
+				diff = p2 - p1
+			}
+			sum += uint32(diff)
+			if sum > maxSum {
+				return sum
+			}
+		}
+		i1--
+		i2--
+		p1 = naphilArray1[i1]
+		p2 = naphilArray2[i2]
+		if p1 != p2 {
+			diff = p1 - p2
+			if p1 < p2 {
+				diff = p2 - p1
+			}
+			sum += uint32(diff)
+			if sum > maxSum {
+				return sum
+			}
+		}
+		i1--
+		i2--
+		p1 = naphilArray1[i1]
+		p2 = naphilArray2[i2]
+		if p1 != p2 {
+			diff = p1 - p2
+			if p1 < p2 {
+				diff = p2 - p1
+			}
+			sum += uint32(diff)
+			if sum > maxSum {
+				return sum
+			}
+		}
+		i1--
+		i2--
+		p1 = naphilArray1[i1]
+		p2 = naphilArray2[i2]
+		if p1 != p2 {
+			diff = p1 - p2
+			if p1 < p2 {
+				diff = p2 - p1
+			}
+			sum += uint32(diff)
+			if sum > maxSum {
+				return sum
+			}
+		}
 	}
-	sum := uint32(0)
-	w32 := uint32(g1.w)
-	h32 := uint32(g1.h)
-	area := uint32(g1.w) * h32
-	maxSum := uint32(maxDiff) * area
-	var pixel1, pixel2 uint8
-	for i := uint32(0); i < w32; i++ {
-		for j := uint32(0); j < h32; j++ {
-			pixel1 = g1.array[i][j]
-			pixel2 = g2.array[i][j]
-			sum += uint32(byteAbsDiff(pixel1, pixel2))
+	if i1 <= start_1 {
+		return sum
+	}
+	/*This handles loops which are not unrolled*/
+	for i1 > start_1 {
+		i1--
+		i2--
+		p1 = naphilArray1[i1]
+		p2 = naphilArray2[i2]
+		if p1 != p2 {
+			diff = p1 - p2
+			if p1 < p2 {
+				diff = p2 - p1
+			}
+			sum += uint32(diff)
 			if sum > maxSum {
 				return sum
 			}
@@ -453,1284 +427,1901 @@ func kern(x uint8) int {
 }
 
 /*
-This determines whether any corresponding corner pixels between two
-grids have corners exceeded a margin. This solved a blotching problem.
+Corner mismatch between two grids.
 */
-func maxCornerDiff(g1 Grid, g2 Grid, maxIn uint8) uint8 {
-	if g1.w != g2.w || g1.h != g2.h {
-		return 255
-	}
-	ww := int(g1.w - 1)
-	hh := int(g1.h - 1)
-	c1 := g1.array[0][0]
-	c2 := g2.array[0][0]
-	diffTemp := byteAbsDiff(c1, c2)
-	if diffTemp < maxIn {
-		c1 = g1.array[0][hh]
-		c2 = g2.array[0][hh]
-		diffTemp = byteAbsDiff(c1, c2)
-		if diffTemp < maxIn {
-			c1 = g1.array[ww][0]
-			c2 = g2.array[ww][0]
-			diffTemp = byteAbsDiff(c1, c2)
-			if diffTemp < maxIn {
-				c1 = g1.array[ww][hh]
-				c2 = g2.array[ww][hh]
-				return byteAbsDiff(c1, c2)
-			}
-		}
-	}
-	return diffTemp
-}
+func gridMismatchCorn(d1 uint64, d2 uint64, margInt uint64) uint8 {
+	var d1_mod, d2_mod uint64
+	c := uint8(4)
 
-/*
-The returns the maximum possible difference between two grids,
-not necessarily at the same position.
-*/
-func getCrossRange(g1 Grid, g2 Grid) uint8 {
-	if g1.w != g2.w || g1.h != g2.h {
-		return 255
-	}
-	crossRangeA := g1.maxLuma - g2.minLuma
-	crossRangeB := g2.maxLuma - g1.minLuma
-	if g1.maxLuma < g2.minLuma || crossRangeB > crossRangeA {
-		return crossRangeB
-	}
-	return crossRangeA
-
-}
-
-/*
-This compares an octet of grids against each other. Octets are explained in
-removeRedundantGrids.
-*/
-func compareGridBoolSingle(array []Grid, margin float64, cursor uint32, octet uint8, u uint32, v uint32) uint8 {
-	/*If there is only one remaining grid in the octet, return it unchanged.*/
-	if u > 6 || v <= u || v-u < 2 {
-		return octet
-	}
-
-	/*Get the subset of the octet that needs to be compared and, if it only has
-	one remaining grid, return the octet unchanged.*/
-	subset := octet
-	if v < 8 {
-		subset %= uint8(1 << v)
-	}
-	subset &= uint8(^((1 << u) - 1))
-	if kern(subset) < 2 {
-		return subset
-	}
-
-	/*The cursors in the grid array, which will be repeatedly referenced below.*/
-	uc := (cursor << 3) + u
-	vc := (cursor << 3) + v
-
-	/*If there are exactly two grids remaining in the octet, and they are not
-	comparable for reasons of different dimensions or different average brightness
-	levels, simply return the octet unchanged.*/
-	if vc-uc == 2 && (array[vc-1].h != array[uc].h || array[vc-1].w != array[uc].w || array[vc-1].avgLuma-array[uc].avgLuma >= uint8(256.0*margin)) {
-		return subset
-	}
-
-	/*If the two grids at the ends have different dimensions, find the first grid
-	with different dimensions than the first and subdivide.*/
-	if array[uc].h != array[vc-1].h || array[uc].w != array[vc-1].w {
-		uNew := u + 1
-		for v < uNew && array[uc].h == array[(cursor<<3)|uNew].h && array[uc].w == array[(cursor<<3)|uNew].w {
-			uNew++
-		}
-		octet1 := compareGridBoolSingle(array, margin, cursor, octet, u, uNew)
-		octet2 := compareGridBoolSingle(array, margin, cursor, octet, uNew, v)
-		return octet1 | octet2
-	}
-
-	/*If the two grids at the end have substantially different average brightness
-	values*/
-	margInt := uint8(margin * 256.0)
-	if array[vc-1].avgLuma-array[uc].avgLuma >= margInt {
-		/*If the average brightness levels of the two grids at the ends are within
-		twice the specified margin, find the first with a brightness level substantially
-		different than the first, and subdivide.*/
-		if margInt < 128 && array[vc-1].avgLuma-array[uc].avgLuma <= margInt<<1 {
-			uNew := u + 1
-			for uNew < v && array[(cursor<<3)+uNew].avgLuma-array[uc].avgLuma < margInt {
-				uNew++
-			}
-			octet1 := compareGridBoolSingle(array, margin, cursor, octet, u, uNew)
-			octet2 := compareGridBoolSingle(array, margin, cursor, octet, uNew, v)
-			return octet1 | octet2
-		}
-		/*If they are more than twice the margin, find the first grid that is "out of reach"
-		of the two ends, and subdivide.*/
-		uNew := u + 1
-		vNew := v - 2
-		for uNew < vNew {
-			if array[(cursor<<3)|uNew].avgLuma-array[uc].avgLuma < margInt {
-				uNew++
-			} else if array[vc-1].avgLuma-array[(cursor<<3)+vNew].avgLuma < margInt {
-				vNew--
-				/*If the grids out of reach of the ends do not overlap, compare the subset of the
-				octet within reach of the first, within reach of the last, and the gap they leave.*/
-			} else {
-				octet1 := compareGridBoolSingle(array, margin, cursor, octet, u, uNew)
-				octet2 := compareGridBoolSingle(array, margin, cursor, octet, uNew, vNew)
-				octet3 := compareGridBoolSingle(array, margin, cursor, octet, vNew, v)
-				return octet1 | octet2 | octet3
-			}
-		}
-		/*If the grids out of reach of the ends do overlap, just subdivide into two.*/
-		octet1 := compareGridBoolSingle(array, margin, cursor, octet, u, uNew)
-		octet2 := compareGridBoolSingle(array, margin, cursor, octet, uNew, v)
-		return octet1 | octet2
-	}
-	/*Note, the above scenario should not be a common occurrence, particularly compared to that
-	where grids of different dimensions are in the same octet, as changes in brightness are more
-	gradual than changes in height or width in a sorted array.*/
-
-	/*The endgame: the octet contains at least two set bits referring to grids which all have the
-	same dimensions and similar brightness levels.*/
-	area := uint32(array[uc].w) * uint32(array[uc].h)
-	for w1 := u; w1 < v-1; w1++ {
-		if (octet>>uint8(w1))%2 == 1 {
-			/*If there is a grid remaining at w1*/
-			a1 := array[(cursor<<3)+w1]
-			range1 := a1.maxLuma - a1.minLuma
-			w1_8 := uint8(w1)
-			/*The grid at w1 might be eliminated, hence the first condition.*/
-			for w2 := w1 + 1; (octet>>w1_8)%2 == 1 && w2 < v; w2++ {
-				/*If there is a grid remaining at w2*/
-				if (octet>>uint8(w2))%2 == 1 {
-					a2 := array[(cursor<<3)+w2]
-					range2 := a2.maxLuma - a2.minLuma
-					/*If two grids have imilar ranges, compare*/
-					if (range1 < margInt && range2 < margInt) || (range1 >= margInt && range2 >= margInt) {
-						/*This gets the maximum possible difference between any two pixels between the
-						grids, regardless of position. If it is within the margin, then one can be eliminated.*/
-						crossRange := getCrossRange(a1, a2)
-						/*Otherwise, if none of the corners of the girds differ outside the margin, there are
-						two justifications for elimination: if the ranges are small and the overall difference
-						is small; or if the ranges are large, while the largest difference between any
-						corresponding pixels is still small.*/
-						if crossRange < margInt || ((a1.w < 16 && a1.h < 16 && a1.w*a1.h <= 16 || maxCornerDiff(a1, a2, margInt) < margInt) && ((range1 < margInt && gridDiffFast(a1, a2, margInt, crossRange) < uint32(margInt)*area) || (range1 >= margInt && gridDiffMax(a1, a2, margInt) < margInt))) {
-							if rand.Uint32()%2 == 0 {
-								octet &= (^(1 << uint8(w1)))
-							} else {
-								octet &= (^(1 << uint8(w2)))
-							}
-						}
-					}
-				}
-			}
-		}
-	}
-	return octet
-}
-
-/*
-This executes the gridDiff functions above based on the range of the grids.
-Various other statements prevent this from executing unless the range of both
-is either above the margin or below the margin.
-*/
-func rangeMaxCheck(r uint8, a1 Grid, a2 Grid, margChar uint8, areaMarg uint32, crossRange uint8) bool {
-	return ((r < margChar && gridDiffFast(a1, a2, margChar, crossRange) < areaMarg) || (r >= margChar && gridDiffMax(a1, a2, margChar) < margChar))
-}
-
-/*
-This takes a predefined set of corners into account (unless the grids have
-an area 16 or below), and if similar executes the above check.
-*/
-func lumaCornerCheck(corner1 uint8, corner2 uint8, corner3 uint8, corner4 uint8, cornerA uint8, cornerB uint8, range1 uint8, a1 Grid, a2 Grid, margChar uint8, areaMarg uint32, crossRange uint8) bool {
-	if a1.h != a2.h || a1.w != a2.w {
-		return false
-	}
-	edgeW := a1.w-1
-	edgeH := a1.h-1
-	return (cornerB > 255-margChar || a2.minLuma < cornerB+margChar) &&
-		(cornerA < margChar || a2.maxLuma > cornerA-margChar) &&
-		((a1.w < 16 && a1.h < 16 && a1.w*a1.h <= 16) || (byteAbsDiff(corner1, a2.array[0][0]) < margChar &&
-			byteAbsDiff(corner2, a2.array[0][edgeH]) < margChar &&
-			byteAbsDiff(corner3, a2.array[edgeW][0]) < margChar &&
-			byteAbsDiff(corner4, a2.array[edgeW][edgeH]) < margChar)) &&
-		rangeMaxCheck(range1, a1, a2, margChar, areaMarg, crossRange)
-}
-
-/*This compares a single grid to an entire octet of different grids.*/
-func compareSingleToOctet(array []Grid, margin float64, octet uint8, cursor uint32, u uint32, v uint32, g Grid) uint16 {
-	margChar := uint8(margin * 256.0)
-	edgeW := g.w
-	edgeH := g.h
-	edgeW--
-	edgeH--
-	var corner1, corner2, corner3, corner4, cornerA, cornerB uint8
-	if (edgeW+1)*(edgeH+1) > 16 {
-		corner1, corner2, corner3, corner4 = getCorners(g.array, edgeW, edgeH)
-		cornerA = minUint8(minUint8(corner1, corner2), minUint8(corner3, corner4))
-		cornerB = maxUint8(maxUint8(corner1, corner2), maxUint8(corner3, corner4))
-	}
-	range1 := g.maxLuma - g.minLuma
-	cursor *= 8
-	/*Area margin, if range1 is below the margin.*/
-	var areaMarg uint32
-	if range1 < margChar {
-		areaMarg = uint32(edgeW) * uint32(edgeH) * uint32(margChar)
-	}
-	for i := u; i < v; i++ {
-		if (octet>>uint8(i))%2 == 1 {
-			f := array[cursor+uint32(i)]
-			range2 := f.maxLuma - f.minLuma
-			if ((range1 < margChar && range2 < margChar) || (range1 >= margChar && range2 >= margChar)) && byteAbsDiff(f.avgLuma, g.avgLuma) < margChar {
-				crossRange := getCrossRange(g, f)
-				if crossRange < margChar || lumaCornerCheck(corner1, corner2, corner3, corner4, cornerA, cornerB, range1, g, f, margChar, areaMarg, crossRange) {
-					/*If the coin-toss removes a grid from the octet, its
-					corresponding bit is unset, like in other functions.
-					If it removes the single grid, the function returns
-					only the octet.*/
-					if rand.Uint32()%2 == 0 {
-						octet &= (^(1 << i))
-					} else {
-						return uint16(octet)
-					}
-				}
-			}
-		}
-	}
-	/*If the single grid makes it to the bitter end, the function
-	returns the octet plus a set bit at spot 9.*/
-	return uint16(256) + uint16(octet)
-}
-
-func maxUint8(x uint8, y uint8) uint8 {
-	if x > y {
-		return x
-	}
-	return y
-}
-func minUint8(x uint8, y uint8) uint8 {
-	if x < y {
-		return x
-	}
-	return y
-}
-
-func getCorners(array [][]uint8, edgeW uint8, edgeH uint8) (uint8, uint8, uint8, uint8) {
-	return array[0][0], array[0][edgeH], array[edgeW][0], array[edgeW][edgeH]
-}
-
-func comparableGrids(g1 Grid, g2 Grid, margChar uint8) bool {
-	if g1.h != g2.h && g1.w != g2.w {
-		return false
-	}
-	if g1.maxLuma-g1.minLuma < margChar {
-		if g2.maxLuma-g2.minLuma > margChar {
-			return false
-		}
-	} else if g2.maxLuma-g2.minLuma < margChar {
-		if g1.maxLuma-g1.minLuma > margChar {
-			return false
-		}
-	}
-	/*If either or both grids have a range exactly equal to
-	the margin, it will return true under the same conditions
-	as for two with ranges under or two with ranges over.*/
-	return byteAbsDiff(g2.avgLuma, g1.avgLuma) < margChar
-}
-
-/*
-This compares grids across two octets whose grids have similar
-areas 16 or below. Using a separate function allowed for
-optimizing corner comparison.
-*/
-func compareGridBoolSub16(array1 []Grid, array2 []Grid, margin float64, bool1 uint8, bool2 uint8, u1 uint8, v1 uint8, u2 uint8, v2 uint8) uint16 {
-	/*k: Stores the number of remaining bits in both octets, with the first
-	three being of the first, and the next three being of the last.*/
-	k := uint8((kern(bool2) * 8) + kern(bool1))
-	i := u1
-	j := u2
-	margChar := uint8(margin * 256.0)
-	/*Will continue as long as there are set bits in the first octet, but
-	can exit early if the number of set bits in either falls below 2.*/
-	for bool1>>i != 0 && k%8 > 1 && k>>3 > 1 {
-		if bool1&(1<<i) != 0 && bool2&(1<<j) != 0 {
-			if comparableGrids(array1[i], array2[j], margChar) {
-				crossRange := getCrossRange(array1[i], array2[j])
-				/*No corner comparison takes place here..*/
-				if crossRange < margChar || rangeMaxCheck(array1[i].maxLuma-array1[i].minLuma, array1[i], array2[j], margChar, uint32(array1[i].w)*uint32(array1[i].h)*uint32(margChar), crossRange) {
-					if rand.Uint32()%2 == 0 {
-						bool1 &= (^(1 << i))
-						k--
-					} else {
-						bool2 &= (^(1 << j))
-						k -= 8
-						for u2 < 8 && bool2&(1<<u2) == 0 {
-							u2++
-						}
-					}
-				}
-			}
-		}
-		/*If there are no more set bits in the second octet, loop back.*/
-		if bool2>>j == 0 {
-			j = u2
-			i++
-			/*Otherwise, just keep going with the second octet.*/
-		} else {
-			j++
-		}
-	}
-	/*If there is only one set bit in the first octet*/
-	if k%8 == 1 {
-		u1 = firstSet(bool1)
-		nonet := compareSingleToOctet(array2, margin, bool2, 0, 0, uint32(len(array2)), array1[u1])
-		/*If the only remaining grid from the first octet
-		did not survive, the first eight bits of the return
-		value will be zero; otherwise, they will mirror the
-		first octet. The last eight mirror the second octet
-		regardless.*/
-		return ((nonet >> 8) * uint16(bool1)) + ((nonet % 256) << 8)
-		/*If there is only one set bit in the second octet*/
-	} else if k>>3 == 1 {
-		u2 = firstSet(bool2)
-		/*Same rules as above, but flipped.*/
-		nonet := compareSingleToOctet(array1, margin, bool1, 0, 0, 8, array2[u2])
-		return ((nonet >> 8) * (uint16(bool2) << 8)) + (nonet % 256)
-	}
-	/*If there are multiple set bits in both octets to
-	the very end, return the two combined into a 16-bit
-	number.*/
-	return uint16(bool1) + (uint16(bool2) << 8)
-}
-
-func compareGridBool(array []Grid, margin float64, cursor1 uint32, cursor2 uint32, bool1 uint8, bool2 uint8, u1 uint32, v1 uint32, u2 uint32, v2 uint32) uint16 {
-	/*
-		k1: The number of grids remaining in the outer loop.
-		k2: The number of grids remaining in the inner loop.
-		margChar: The margin in 8-bit form.
-		margInt: The margin in 32-bit form.
-		v1_char: The cursor of the last set bit of the outer loop.
-		v2_char: The cursor of the last set bit of the inner loop.
-		u2_char: The cursor of the last set bit of the inner loop.
-		i: The cursor of the outer loop.
-		j: The cursor of the inner loop.
-
-		cursor1_mod: The cursor of the grid of the outer loop.
-		a1: Such a grid
-		edgeW: The width of the grid, minus 1.
-		edgeH: The height of the grid, minus 1.
-		areaMarg: The area of the grid times the margin in 32-bit form.
-		cursor2_mod: The cursor of the grid of the inner loop.
+	/*From the outset, the corners occupy the bottom 32 bits of a
+	64-bit number for technical reasons explained above. The loop
+	examines the bottom 8, and shifts the corners each time until
+	it finds either two corresponding corners between grids that
+	are very different or one of the sets of corners is zeroed
+	out.
 	*/
-	k1 := uint8(kern(bool1))
-	k2 := uint8(kern(bool2))
-	margChar := uint8(margin * 256.0)
-	margInt := uint32(margChar)
-	v1_char := uint8(v1)
-	u2_char := uint8(u2)
-	i := uint8(u1)
-	j := u2_char
-
-	cursor1_mod := cursor1 << 3
-	a1 := array[cursor1_mod+u1]
-	edgeW := a1.w
-	edgeH := a1.h
-	areaMarg := uint32(edgeW) * uint32(edgeH) * margInt
-	edgeW--
-	edgeH--
-	cursor2_mod := (cursor1 << 3) + u2
-	corner1, corner2, corner3, corner4 := getCorners(a1.array, edgeW, edgeH)
-	cornerA := minUint8(minUint8(corner1, corner2), minUint8(corner3, corner4))
-	cornerB := maxUint8(maxUint8(corner1, corner2), maxUint8(corner3, corner4))
-
-	for i < v1_char && k1 > 1 && k2 > 1 {
-		/*If there is a remaining grid at i*/
-		if bool1&(1<<i) != 0 {
-			/*Since u1 was never going to exceed 7 nor used otherwise in this
-			loop, 255 is added to it when incrementing. This triggers the
-			routine below to reset various values to be compared below, which
-			resets u1 to its original value. This is because i might not
-			necessarily be incremented during a cycle of this loop, and this
-			prevents repeated reevaluations from grids which might have
-			already been eliminated.*/
-			if u1 > 255 {
-				u1 %= 255
-				/*Calculating corners here provides a slight speed boost compared
-				to using maxCornerDiff.*/
-				a1 := array[cursor1_mod]
-				edgeW = a1.w - 1
-				edgeH = a1.h - 1
-				corner1, corner2, corner3, corner4 = getCorners(a1.array, edgeW, edgeH)
-				cornerA = minUint8(minUint8(corner1, corner2), minUint8(corner3, corner4))
-				cornerB = maxUint8(maxUint8(corner1, corner2), maxUint8(corner3, corner4))
-			}
-			if bool2&(1<<j) != 0 {
-				if bool2&(1<<j) != 0 {
-					a2 := array[cursor2_mod]
-					/*Since comparison takes place across grids, there is still the
-					possibiility that two grids might have different dimensions or
-					substantially different average brightness levels, and
-					particularly different ranges.*/
-					if comparableGrids(a1, a2, margChar) {
-						crossRange := getCrossRange(a1, a2)
-						/*Same rules apply as in compareGridBoolSingle to determine
-						whether either should be eliminated.*/
-						if crossRange < margChar || ((edgeW >= 15 || edgeH >= 15 || (edgeW+1)*(edgeH+1) > 16) && lumaCornerCheck(corner1, corner2, corner3, corner4, cornerA, cornerB, a1.maxLuma-a1.minLuma, a1, a2, margChar, areaMarg, crossRange)) || (edgeW < 15 && edgeH < 15 && (edgeW+1)*(edgeH+1) <= 16 && rangeMaxCheck(a1.maxLuma-a1.minLuma, a1, a2, margChar, areaMarg, crossRange)) {
-							if rand.Uint32()%2 != 0 {
-								bool1 &= (^(1 << i))
-								k1--
-							} else {
-								bool2 &= (^(1 << j))
-								k2--
-								for u2 < 8 && bool2&(1<<u2) == 0 {
-									u2++
-								}
-							}
-						}
-					}
-				}
-			}
-			if bool2>>j != 0 && bool1&(1<<i) != 0 {
-				j++
-				cursor2_mod++
-			} else {
-				j = u2_char
-				cursor2_mod = (cursor2 << 3) + u2
-				i++
-				cursor1_mod++
-				u1 += 255
-			}
-		} else {
-			i++
-			cursor1_mod++
+loopStart:
+	d1_mod = d1 & 0xFF
+	d2_mod = d2 & 0xFF
+	if d1_mod != d2_mod {
+		d1_mod >>= 24
+		d2_mod >>= 24
+		if (d1_mod > d2_mod && d1_mod-d2_mod > margInt) ||
+			(d2_mod > d1_mod && d2_mod-d1_mod > margInt) {
+			return c
 		}
 	}
-	if k1 == 1 {
-		cursor1_mod = cursor1 << 3
-		for u1 < 8 && bool1&(1<<uint8(u1)) == 0 {
-			u1++
-			cursor1_mod++
-		}
-		if cursor1_mod < uint32(len(array)) {
-			nonet := compareSingleToOctet(array, margin, bool2, cursor2, u2, v2, array[cursor1_mod])
-			return ((nonet >> 8) * uint16(bool1)) + ((nonet % 256) << 8)
-		}
-	} else if k2 == 1 {
-		cursor2_mod = cursor2 << 3
-		u2_char = 0
-		for u2_char < 8 && bool2&(1<<u2_char) == 0 {
-			u2_char++
-			cursor2_mod++
-		}
-		if cursor2_mod < uint32(len(array)) {
-			nonet := compareSingleToOctet(array, margin, bool1, cursor1, u1, v1, array[cursor2_mod])
-			return ((nonet >> 8) * (uint16(bool2) << 8)) + (nonet % 256)
-		}
+	c--
+	d1 >>= 8
+	d2 >>= 8
+	if d1 != 0 && d2 != 0 {
+		goto loopStart
 	}
-	/*Return both octets back as 16-bit value.*/
-	return uint16(bool1) + (uint16(bool2) << 8)
-}
-
-/*Location of the first set bit*/
-func firstSet(octet uint8) uint8 {
-	u := uint8(0)
-	for u < 8 {
-		if (octet>>u)%2 == 1 {
-			return u
+	if d1 == 0 {
+		goto loopStart2
+	}
+	if d2 == 0 {
+		goto loopStart1
+	}
+	goto loopEnd
+	/*In these two loops, one of the grids has zero as its
+	remaining corners, and the other one is simply checked
+	if any of its corners' absolute values exceeds the margin.*/
+loopStart1:
+	if d1 != 0 {
+		d1_mod = d1 & 0xFF
+		if d1_mod > margInt {
+			return c
 		}
-		u++
+		c--
+		d1 >>= 8
+		goto loopStart1
 	}
-	return 8
-}
-
-/*Location of the last set bit*/
-func lastSet(octet uint8, u uint8) uint8 {
-	v := u
-	for v < 8 && octet>>v != 0 {
-		v++
-	}
-	return v
-}
-
-func twoSingles(g1 Grid, g2 Grid, margChar uint8, bool1 uint8, bool2 uint8, ka int) (uint8, uint8, int) {
-	crossRange := getCrossRange(g1, g2)
-	range1 := g1.maxLuma - g1.minLuma
-	range2 := g2.maxLuma - g2.minLuma
-	if crossRange < margChar || (((range1 < margChar && range2 < margChar) || (range1 >= margChar && range2 >= margChar)) && (g1.w < 16 && g1.h < 16 && g1.w*g1.h <= 16 || maxCornerDiff(g1, g2, margChar) < margChar) && rangeMaxCheck(range1, g1, g2, margChar, uint32(g1.w)*uint32(g1.h)*uint32(margChar), crossRange)) {
-		if rand.Uint32()%2 != 0 {
-			return 0, bool2, 0
-		} else {
-			return bool1, 0, ka
+loopStart2:
+	if d2 != 0 {
+		d2_mod = d2 & 0xFF
+		if d2_mod > margInt {
+			return c
 		}
+		c--
+		d2 >>= 8
+		goto loopStart2
 	}
-	return bool1, bool2, ka
-}
-
-func firstSetSafe(octet uint8, arrayLen uint32, i uint32) uint8 {
-	u := firstSet(octet)
-	for u > 0 && ((octet>>u)%2 == 0 || (i<<3)+uint32(u) >= arrayLen) {
-		u--
-	}
-	return u
-}
-
-func lastSetSafe(octet uint8, arrayLen uint32, i uint32, u uint8, array []Grid, g Grid, margChar uint8, comp bool) uint8 {
-	v := lastSet(octet, u+1)
-	/*The loop can end if v2 is in bounds, it corresponds to a set bit, and the grid it references
-	is comparable to gv.*/
-	for v > u+1 && ((i<<3)+uint32(v)-1 > arrayLen || octet>>(v-1) != 0 || (!comp || !comparableGrids(array[(i<<3)+uint32(v)], g, margChar))) {
-		v--
-	}
-	return v
+loopEnd:
+	return 0
 }
 
 /*
-This uses Kernighan's algorithm on a subset of
-a byte.
+This peforms a binary search on a grid array to check for the
+average or a corner. A goto loop was chosen over recursion due
+to overhead concerns.
 */
-func kernSubset(bbyte uint8, u uint8, v uint8) int {
-	if v < 8 {
-		return kern((bbyte % (1 << v)) >> u)
-	}
-	return kern(bbyte >> u)
-}
-
-/*This is the intermediary between removeRedundantGrids and compareGridBool.*/
-func compareDoubles(boolArray []uint8, a uint32, b uint32, array []Grid, u1 uint32, v1 uint32, margin float64) {
-	/*In case the first remaining grid in the first octet is
-	substanially different than the last in the same octet*/
-	for u1 < v1-1 && (array[(a<<3)+u1].h != array[(a<<3)+v1-1].h || array[(a<<3)+u1].w != array[(a<<3)+v1-1].w || byteAbsDiff(array[((a+1)<<3)].avgLuma, array[(a<<3)+v1-1].avgLuma) > uint8(256.0*margin)) {
-		u1++
-	}
-	margChar := uint8(margin * 256.0)
-	gv := array[(a<<3)+(v1-1)]
-	arrayLen := uint32(len(array))
-	ka := kernSubset(boolArray[a], uint8(u1), uint8(v1))
-	for i := a + 1; ka != 0 && i < b; i++ {
-		if boolArray[i] != 0 {
-			u2 := firstSetSafe(boolArray[i], arrayLen, i)
-			u2_32 := uint32(u2)
-			/*This will almost certainly be true, but in case it
-			isn't, simply do not execute the loop further.*/
-			if comparableGrids(array[(i<<3)+uint32(u2)], gv, margChar) {
-				v2 := uint32(lastSetSafe(boolArray[i], arrayLen, i, u2, array, gv, margChar, true))
-				ki := kernSubset(boolArray[i], u2, uint8(v2))
-				/*If there is at least one remaining grid in both octets*/
-				if ki != 0 && ka != 0 {
-					/*If there are multiple remaining grids in both octets*/
-					if ki > 1 && ka > 1 {
-						var doublet uint16
-						/*If the grids in the octets have an area 16 or below*/
-						if gv.w < 16 && gv.h < 16 && gv.w*gv.h <= 16 {
-							doublet = compareGridBoolSub16(array[(a*8):(a+1)*8], array[(i*8):minUint32((i+1)*8, arrayLen)], margin, boolArray[a], boolArray[i], uint8(u1), uint8(v1), u2, uint8(v2))
-							/*Otherwise*/
-						} else {
-							doublet = compareGridBool(array, margin, a, i, boolArray[a], boolArray[i], u1, v1, u2_32, v2)
-						}
-						/*This checks if the first octet was altered.*/
-						newA := uint8(doublet % 256)
-						if newA != boolArray[a] {
-							if newA != 0 {
-								u1 = uint32(firstSetSafe(newA, arrayLen, i))
-								v1 = uint32(lastSetSafe(newA, arrayLen, a, uint8(u1), array, gv, margChar, false))
-								gv = array[(a<<3)+(v1-1)]
-								ka = kernSubset(boolArray[a], uint8(u1), uint8(v1))
-							} else {
-								ka = 0
-							}
-							boolArray[a] = newA
-						}
-						boolArray[i] = uint8(doublet >> 8)
-					} else {
-						/*If there is only one remaining octet in both*/
-						if ka == 1 && ki == 1 {
-							boolArray[a], boolArray[i], ka = twoSingles(array[(a<<3)+u1], array[(i<<3)+u2_32], margChar, boolArray[a], boolArray[i], ka)
-							/*If the second only has one remaining octet*/
-						} else if ki == 1 {
-							nonet := compareSingleToOctet(array, margin, boolArray[a], a, u2_32, v2, array[(i<<3)+u2_32])
-							if nonet < 256 {
-								boolArray[i] = 0
-							}
-							boolArray[a] = uint8(nonet % 256)
-							/*If the first only has one remaining octet*/
-						} else {
-							nonet := compareSingleToOctet(array, margin, boolArray[i], i, u2_32, v2, array[(a<<3)+u1])
-							if nonet < 256 {
-								boolArray[a] = 0
-								ka = 0
-							}
-							boolArray[i] = uint8(nonet % 256)
-						}
-					}
-				}
-			}
-		}
-	}
-}
-
-/*
-This finds the closest cursor in an array to a grid with the
-specified width, height, and average luma value, using a binary
-search.
-*/
-func mostComparableCursor(array []Grid, a uint32, b uint32, targetW uint8, targetH uint8, targetLuma uint8) uint32 {
-	var m uint32
-	for a < b {
-		m = a + ((b - a) >> 1)
-		if array[m].w > targetW || (array[m].w == targetW && (array[m].h > targetH || (array[m].h == targetH && array[m].avgLuma >= targetLuma))) {
-			b = m
-		} else {
+func binarySearchGridArray(array []Grid, a int, b int, shift_amount uint64, query uint64) int {
+	var m int
+searchStart:
+	if a < len(array) && b < len(array) && a < b {
+		m = a + ((b - a) / 2)
+		if (array[m].dimCornAvg>>shift_amount)&255 < query {
 			a = m + 1
+			goto searchStart
 		}
+		b = m
+		goto searchStart
 	}
 	return a
 }
 
 /*
-This determines whether two grids are identical. It is
-used when restructuring a pruned array.
+This finds not only the last grid in an array with the same
+average or corner value as the current cursor, but also the
+last with one of a similar (defined by the margin) value.
 */
-func isDupe(g1 Grid, g2 Grid) bool {
-	if g1.w != g2.w {
-		return false
+func findEndpoints(array []Grid, cursor int, shift_amount uint64, end_in int, m_64 uint64) (uint64, int, int) {
+	var marg_end, end_out int
+	var query uint64
+	query = array[cursor].dimCornAvg
+	if shift_amount != 0 {
+		query >>= shift_amount
 	}
-	if g1.h != g2.h {
-		return false
+	query &= 0xFF
+	end_out = end_in
+	if query < 255 {
+		end_out = binarySearchGridArray(array, cursor+1, end_in, shift_amount, query+1)
 	}
-	if g1.avgLuma != g2.avgLuma {
-		return false
+	marg_end = end_in
+	if query < 255-m_64 {
+		marg_end = binarySearchGridArray(array, end_out+1, end_in, shift_amount, query+m_64)
 	}
-	if g1.maxLuma != g2.maxLuma {
-		return false
-	}
-	if g1.minLuma != g2.minLuma {
-		return false
-	}
-	w32 := uint32(g1.w)
-	h32 := uint32(g1.h)
-	for i := uint32(0); i < w32; i++ {
-		for j := uint32(0); j < h32; j++ {
-			if g1.array[i][j] != g2.array[i][j] {
-				return false
-			}
-		}
-	}
-	return true
+	return query, end_out, marg_end
 }
 
 /*
-After redundant grids have been found, this places all of them
-at the end, and the non-redundant grids at the beginning.
-Grids are set to 0 dimensions instead of being deleted from the
-slice to reduce garbage collection time.
+This finds the first and last grids with average and corner
+values immediately above the one at cursor i.
 */
-func restructuredBoolArray(boolArray []uint8, boolLen uint32, array []Grid, arrayLen uint32) {
-	newTotal := uint32(0)
-	for i := uint32(0); i < boolLen; i++ {
-		newTotal += uint32(kern(boolArray[i]))
+func findNewEndpoints(array []Grid, i int, j int, shift_amount uint64, end int) (int, int, bool) {
+	tempValue := array[i].dimCornAvg
+	if shift_amount != 0 {
+		tempValue >>= shift_amount
 	}
-
-	if newTotal >= arrayLen {
-		return
+	tempValue &= 0xFF
+	if tempValue == 255 {
+		return j, j + 1, true
 	}
-	/*This indicates how many swaps there have been between redundant
-	and non-redundant grids.*/
-	resettled := uint32(0)
-
-	/*This value, ii, is the cursor meant to seek out eliminated grids.*/
-	ii := uint32(0)
-	for ii < arrayLen && (boolArray[ii>>3]>>uint8(ii%8))%2 == 1 {
-		ii++
+	new_start := binarySearchGridArray(array, j, end, 24, tempValue+1)
+	new_end := end
+	if tempValue < 254 {
+		new_end = binarySearchGridArray(array, new_start+1, end, 24, tempValue+2)
 	}
-	/*This value, jj, is meant to seek out grids that have not been
-	eliminated.*/
-	jj := ii + 1
-	for jj < arrayLen && jj>>3 < boolLen && (boolArray[jj>>3]>>uint8(jj%8))%2 == 0 {
-		jj++
-	}
-
-	/*T*/
-	for jj < arrayLen && jj>>3 < boolLen && resettled < newTotal {
-		/*If jj is not at a non-redundant grid, continue seeking one out. */
-		if (boolArray[jj>>3]>>uint8(jj%8))%2 == 0 {
-			jj++
-			/*If it is, and ii is at a redundant grid, swap them.*/
-		} else if (boolArray[ii>>3]>>uint8(ii%8))%2 == 0 {
-			if !isDupe(array[ii], array[jj]) {
-				array[ii], array[jj] = array[jj], array[ii]
-			}
-			array[jj].w = 0
-			array[jj].h = 0
-			resettled++
-			boolArray[ii>>3] |= (1 << (ii % 8))
-			boolArray[jj>>3] &= (^(1 << (jj % 8)))
-			ii++
-			jj++
-			/*If ii is not at a redundant grid, continue seeking one out.*/
-		} else {
-			ii++
-		}
-	}
-	ii = resettled
-	/*Clear out the remaining grids.*/
-	for ii < arrayLen {
-		if array[ii].w != 0 || array[ii].h != 0 {
-			array[ii].w = 0
-			array[ii].h = 0
-		}
-		ii++
-	}
+	return new_start, new_end, false
 }
 
-func compareSingle(array []Grid, arrayLen uint32, cursor uint32, octet uint8, margin float64) uint8 {
-	u := uint32(firstSet(octet))
-	for u > 0 && (((cursor*8)+u) >= arrayLen || (octet>>uint8(u))%2 == 0) {
-		u--
+/*
+This blends the above functions to find the first and last grids
+for a specific query, and the last within a certain margin.
+*/
+func findNewEndpointsMarg(array []Grid, start int, end int, shift_amount uint64, query uint64, m_64 uint64) (int, int, int) {
+	new_start := binarySearchGridArray(array, start, end, shift_amount, query)
+	new_end := end
+	if query < 255 {
+		new_end = binarySearchGridArray(array, new_start, end, shift_amount, query+1)
 	}
-	if (octet>>uint8(u))%2 == 1 {
-		v := uint32(lastSet(octet, uint8(u+1)))
-		for v > u && (((cursor*8)+v-1) >= arrayLen || (octet>>uint8(v-1))%2 == 0) {
-			v--
-		}
-		if (octet>>uint8(v-1))%2 == 1 && v > u+1 {
-			octet = compareGridBoolSingle(array, margin, cursor, octet, u, v)
-		}
+	marg_end := new_end
+	if query < 255-m_64 {
+		marg_end = binarySearchGridArray(array, new_start, end, shift_amount, query+m_64)
 	}
-	return octet
+	return new_start, new_end, marg_end
 }
 
-/*This eliminates grids that are similar within a margin.*/
-func removeRedundantGrids(array []Grid, margin float64, tNum uint32) []Grid {
-	arrayLen := uint32(len(array))
-	comparisons_made := uint64(0)
+func removeRedundantGrids(array []Grid, margin float64, tNum int, naphilArray []uint8) []Grid {
+	tellTime := false
+	startTime := time.Now().Unix()
+
+	arrayLen := len(array)
+
+	/*The margin that is used to determine whether grids stay or go.*/
 	margInt := uint8(margin * 256.0)
+	m_64 := uint64(margInt)
+	margin_signed := int(margInt)
 
-	/*The set of grids which will remain is expressed in an array of
-	8-bit integers, each called an octet. If they are set at the end
-	of this process, that means they stay. If they are unsset, that
-	means they go.
-	The extra statements in the length of the octet array is to
-	accomodate numbers of grids that are not divisible by 8.*/
-	boolLen := (arrayLen >> 3) + ((arrayLen % 2) | ((arrayLen >> 1) % 2) | ((arrayLen >> 2) % 2))
-	boolArray := make([]uint8, boolLen)
-	for i := uint32(0); i < boolLen; i++ {
-		boolArray[i] = 255
-	}
-	if arrayLen%8 != 0 {
-		boolArray[boolLen-1] = uint8((1 << (arrayLen % 8)) - 1)
-	}
+	/*Used in binary searches*/
+	x_ := 0
+	y_ := arrayLen
 
-	/*Perform single-octet comparison through the whole array.*/
-	for i := uint32(0); i < boolLen; i += tNum {
-		if 1000000000 < time.Now().UnixNano()-start {
-			fmt.Printf("%f%%\n", 100.0*float64(i)/float64(boolLen))
-			start = time.Now().UnixNano()
-		}
-		wg.Add(int(tNum))
-		for j := uint32(0); j < tNum; j++ {
-			go func(j uint32) {
-				defer wg.Done()
-				if i+j < boolLen {
-					boolArray[i+j] = compareSingle(array, arrayLen, i+j, boolArray[i+j], margin)
-				}
-			}(j)
-		}
-		wg.Wait()
-		comparisons_made += uint64(tNum*28)
-	}
-	for i := uint32(0); i < tNum; i++ {
-		wg.Add(1)
-		go func(i uint32) {
-			defer wg.Done()
-			/*Endpoints for the multithreaded part.*/
-			end1 := i * boolLen / tNum
-			end2 := (i + 1) * boolLen / tNum
-			if end2 > boolLen {
-				end2 = boolLen
+	/*Finding where shallow grids (those with lesser differences
+	between min-max luma values) end and deep grids (those with
+	greater differences) begin.*/
+	var rangeCutoff int
+	if margInt == 255 {
+		rangeCutoff = arrayLen
+	} else {
+		for x_ < y_ {
+			mid := x_ + ((y_ - x_) / 2)
+			if array[mid].dimCornAvg>>56 == 0 {
+				x_ = mid + 1
+			} else {
+				y_ = mid
 			}
-			for j := end1; j < end2; j++ {
-				/*First set bit of current octet*/
-				u := uint32(firstSet(boolArray[j]))
-				for u > 0 && (((j*8)+u) >= arrayLen || (boolArray[j]>>uint8(u))%2 == 0) {
-					u--
-				}
-				/*In case something goes haywire.*/
-				if boolArray[j]&(1<<uint8(u)) != 0 {
-					v := uint32(lastSet(boolArray[i], uint8(u+1)))
-					for v > u+1 && (((j*8)+v-1) >= arrayLen || (boolArray[j]>>uint8(v-1))%2 == 0) {
-						v--
-					}
-					gv := array[(j<<3)+(v-1)]
-					var k uint32
+		}
+		rangeCutoff = x_
+	}
 
-					/*Finding the last octet with comparable grids*/
-					if gv.avgLuma >= 255-margInt {
-						k = mostComparableCursor(array, j<<3, end2, gv.w, gv.h, 255)
+	/*These will store the cross-range (greatest possible difference
+	between two pixels in different grids) and the corner that is
+	mismatche between two grids.*/
+	var crossRange, mis uint8
+	/*These will store the product of the area of the grid and margin
+	(for the purposes of comparing shallow grids with each other), and
+	offsets in the pixel array that grids point to.*/
+	var g1_offset int
+
+	/*The dimensions of the first grid.*/
+	dims := (array[0].dimCornAvg >> 40) & 0xFFFF
+
+	/*Determining the beginning and end of parallelized subsections of the loop below. The endpoints
+	are set to dimension-based boundaries in the array to ensure all grids are compared with similar
+	grids. Some possible comparisons would be missed if the loop divisions fell in the middle of
+	a subset of grids with equal dimensions.*/
+	var loopDivs []int
+	if tNum > 1 {
+		loopDivs = make([]int, tNum+1)
+		loopDivs[0] = 0
+		loopDivs[tNum] = rangeCutoff
+		for i := 1; i < tNum; i++ {
+			tempDiv := i * arrayLen / tNum
+			dims := (array[tempDiv].dimCornAvg >> 40) & 0xFFFF
+			wTemp := array[tempDiv].getW()
+			hTemp := array[tempDiv].getH()
+			/*The initial boundary falls in the middle of a subset of gris with equal dimensions.*/
+			if (array[tempDiv-1].dimCornAvg>>40)&0xFFFF == dims && (array[tempDiv+1].dimCornAvg>>40)&0xFFFF == dims {
+				a := loopDivs[i-1]
+				b := max(0, tempDiv-1)
+				var m int
+				var gTemp Grid
+
+				/*Finnding the first grid that matches the dimensions*/
+				for a < b {
+					m = a + ((b - a) / 2)
+					gTemp = array[m]
+					if gTemp.getH() == hTemp && gTemp.getW() == wTemp {
+						b = m
 					} else {
-						k = mostComparableCursor(array, j<<3, end2, gv.w, gv.h, gv.avgLuma+margInt)
-					}
-					k >>= 3
-
-					/*Finding which actually has remaining grids*/
-					for k >= boolLen || (boolArray[k] == 0 && k > j+1) {
-						k--
-					}
-
-					if k > j+1 {
-						compareDoubles(boolArray, j, k, array, u, v, margin)
-						comparisons_made += (64*uint64(arrayLen-j))
+						a = m + 1
 					}
 				}
-			}
-		}(i)
+				div1 := a
 
+				/*Finnding the last grid that matches the dimensions*/
+				a = min(tempDiv+1, rangeCutoff)
+				b = rangeCutoff
+				for a < b {
+					m = a + ((b - a) / 2)
+					if gTemp.getH() == hTemp && gTemp.getW() == wTemp {
+						a = m + 1
+					} else {
+						b = 1
+					}
+				}
+				div2 := a
+
+				/*Choose the beginning or end of this subset depending
+				on which is closer to the original estimate*/
+				if tempDiv-div1 > div2-tempDiv {
+					tempDiv = div2
+				} else {
+					tempDiv = div1
+				}
+			}
+			loopDivs[i] = tempDiv
+		}
+	}
+
+	/*This loop is concerned with comparing shallow grids with each other.
+	The cross-range calculation procedure and the comparison function is
+	different between these and the deep grids, in addition to occupying
+	different sections of the array.*/
+	wg := sync.WaitGroup{}
+	for i__ := range tNum {
+		var start, end int
+		if tNum > 1 {
+			start, end = loopDivs[i__], loopDivs[i__+1]
+		} else {
+			start, end = 0, rangeCutoff
+		}
+		wg.Add(1)
+		go func(start, end int) {
+			defer wg.Done()
+			rBits := rand.Uint64()
+			i := start
+			w_curr := array[start].getW()
+			h_curr := array[start].getH()
+
+			/*A signed variable containing the grid's area, used both to determine
+			the total allowable difference between two shallow grids and use for
+			offsets in the pixel data array.*/
+			area_signed := int(w_curr) * int(h_curr)
+			areaMarg := area_signed * margin_signed
+
+			x_ := start + 1
+			y_ = end
+			var gTemp Grid
+			for x_ < y_ {
+				mid := x_ + ((y_ - x_) / 2)
+				gTemp = array[mid]
+				if gTemp.getW() != w_curr || gTemp.getH() != h_curr {
+					y_ = mid
+				} else {
+					x_ = mid + 1
+				}
+			}
+			dim_end := x_
+
+			/*Determining the last grids similar to the first grid in various aspects.*/
+			_, avg_end, avg_marg_end := findEndpoints(array, 0, 32, dim_end, m_64)
+			c1, c1_end, c1_marg_end := findEndpoints(array, 0, 24, avg_end, m_64)
+			c2, c2_end, c2_marg_end := findEndpoints(array, 0, 16, c1_end, m_64)
+			c3, c3_end, c3_marg_end := findEndpoints(array, 0, 8, c2_end, m_64)
+			c4, c4_end, c4_marg_end := findEndpoints(array, 0, 0, c3_end, m_64)
+
+			/*These are used to reset the above values below.*/
+			var new_c1_start, new_c1_end, new_c2_start, new_c2_end, new_c3_start, new_c3_end, new_avg_start, new_avg_end, j, new_j int
+
+			var g1 Grid
+
+			var breakLoop bool
+
+		loopStart_shallow:
+			if i < end {
+				if tellTime && time.Now().Unix() > startTime {
+					fmt.Printf("%d	%d\n", i, j)
+					startTime = time.Now().Unix()
+				}
+				/*If a grid is eliminated, its metadata value will have 0xFF placed
+				at the highest 16 bits.*/
+				if array[i].dimCornAvg>>56 != 255 {
+					/*If nothing changes between the dimensions, averages, or corners
+					between the previous and current grid, go to the section of code
+					where the current grid is compared to subsequent grids. Otherwise,
+					change the indices.*/
+					if i < c4_end {
+						g1 = array[i]
+						j = i + 1
+						g1_offset = g1.offset
+						goto comparison_shallow
+					}
+					if i >= c3_end {
+						if i >= c2_end {
+							if i >= c1_end {
+								if i >= avg_end {
+									if i >= dim_end {
+										goto reset_dim_shallow
+									}
+									goto reset_avg_shallow
+								}
+								goto reset_c1_shallow
+							}
+							goto reset_c2_shallow
+						}
+						goto reset_c3_shallow
+					}
+					goto reset_c4_shallow
+				reset_dim_shallow:
+					w_curr = array[i].getW()
+					h_curr = array[i].getH()
+					area_signed = int(w_curr) * int(h_curr)
+					areaMarg = area_signed * margin_signed
+
+					x_ = i + 1
+					y_ = end
+					/*Find the last grid with dimensions equal to the current one.*/
+				binarySearchLoop_shallow:
+					if x_ < y_ {
+						mid := x_ + ((y_ - x_) / 2)
+						gTemp = array[mid]
+						if gTemp.getW() == w_curr && gTemp.getH() == h_curr {
+							x_ = mid + 1
+							goto binarySearchLoop_shallow
+						}
+						y_ = mid
+						goto binarySearchLoop_shallow
+					}
+					dim_end = x_
+
+					/*Reset the appropriate dimension values accordingly.*/
+					area_signed = int(w_curr) * int(h_curr)
+					areaMarg = area_signed * margin_signed
+
+					/*Resetting everything else besides dimensions*/
+				reset_avg_shallow:
+					_, avg_end, avg_marg_end = findEndpoints(array, i, 32, dim_end, m_64)
+				reset_c1_shallow:
+					c1, c1_end, c1_marg_end = findEndpoints(array, i, 24, avg_end, m_64)
+				reset_c2_shallow:
+					c2, c2_end, c2_marg_end = findEndpoints(array, i, 16, c1_end, m_64)
+				reset_c3_shallow:
+					c3, c3_end, c3_marg_end = findEndpoints(array, i, 8, c2_end, m_64)
+				reset_c4_shallow:
+					c4, c4_end, c4_marg_end = findEndpoints(array, i, 0, c3_end, m_64)
+
+					/*Comparing grids to other grids*/
+				comparison_shallow:
+					if j < c4_marg_end {
+						if tellTime && time.Now().Unix() > startTime {
+							fmt.Printf("%d	%d\n", i, j)
+							startTime = time.Now().Unix()
+						}
+						/*If the grid at j has not been eliminated*/
+						if array[j].dimCornAvg>>56 != 255 {
+							g2 := array[j]
+							/*It will actually be fairly common among adjacent shallow grids
+							for their metadata variables to have a difference less than the
+							margin. If not, however, it checks if there is a significant
+							mismatch.*/
+							if g2.dimCornAvg-g1.dimCornAvg >= m_64 {
+								mis = gridMismatchCorn(g1.dimCornAvg&0xFFFFFFFF, g2.dimCornAvg&0xFFFFFFFF, m_64)
+								/*The general algorithm for a mismatch is to find new endpoints
+								(including margin) for level above the mismatch, then at the level
+								of the mismatch and everthing downstream (excluding margin) before
+								stopping at the fourth corner.*/
+								if mis != 0 {
+									if mis == 1 {
+										goto check_1
+									} else if mis < 3 {
+										goto check_2
+									} else if mis < 4 {
+										goto check_3
+									} else {
+										goto check_4
+									}
+								check_1:
+									new_avg_start, new_avg_end, breakLoop = findNewEndpoints(array, i, j, 32, avg_marg_end)
+									if breakLoop {
+										j = c4_marg_end
+										goto increment_shallow
+									}
+									new_c1_start, new_c1_end, c1_marg_end = findNewEndpointsMarg(array, new_avg_start, new_avg_end, 24, c1, m_64)
+									goto skip_2
+								check_2:
+									new_c1_start, new_c1_end, breakLoop = findNewEndpoints(array, i, j, 24, c1_marg_end)
+									if breakLoop {
+										j = c4_marg_end
+										goto increment_shallow
+									}
+								skip_2:
+									new_c2_start, new_c2_end, c2_marg_end = findNewEndpointsMarg(array, new_c1_start, new_c1_end, 16, c2, m_64)
+									goto skip_3
+								check_3:
+									new_c2_start, new_c2_end, breakLoop = findNewEndpoints(array, i, j, 16, c2_marg_end)
+									if breakLoop {
+										j = c4_marg_end
+										goto increment_shallow
+									}
+								skip_3:
+									new_c3_start, new_c3_end, c3_marg_end = findNewEndpointsMarg(array, new_c2_start, new_c2_end, 8, c3, m_64)
+									goto skip4
+								check_4:
+									new_c3_start, new_c3_end, breakLoop = findNewEndpoints(array, i, j, 8, c3_marg_end)
+									if breakLoop {
+										j = c4_marg_end
+										goto increment_shallow
+									}
+								skip4:
+									new_j = binarySearchGridArray(array, new_c3_start, new_c3_end, 0, c4) - 1
+									/*This solved a softlock issue.*/
+									if new_j >= j {
+										j = new_j
+									}
+									goto increment_shallow
+								}
+							}
+							/*The algorithm for determining a cross-range (or even deciding
+							to calculate one) is as follows:
+							If two grids have the same min-max values, then it goes to the
+							cointoss, since shallow grids by definition already have a difference
+							of min-max values below the margin.
+							If the maximum or the minimum between two grids is equal, but not both,
+							but both are still within the margin, it goes to the cointoss. If they
+							are not necessarily in the margin, the cross range is the difference of
+							the shared value and the furthest unshared value.
+							Finally, if min-max are both different between the grids, cross-range is
+							whichever is the greatest difference between opposite grids.*/
+							max1 := g1.maxLuma
+							max2 := g2.maxLuma
+							min1 := g1.minLuma
+							min2 := g2.minLuma
+							if min1 == min2 {
+								if max1 == max2 {
+									goto coinToss_shallow
+								}
+								if max1-min1 < margInt {
+									if max2-min1 < margInt {
+										goto coinToss_shallow
+									}
+									crossRange = max2 - min1
+								}
+								if max1 > max2 {
+									crossRange = max1 - min1
+								} else {
+									crossRange = max2 - min1
+								}
+							} else if max1 == max2 {
+								if max1-min1 < margInt {
+									if max1-min2 < margInt {
+										goto coinToss_shallow
+									}
+									crossRange = max1 - min2
+								}
+								if min1 < min2 {
+									crossRange = max1 - min1
+								} else {
+									crossRange = max1 - min2
+								}
+							} else if max2-min1 > max2-min1 {
+								crossRange = max2 - min1
+							} else {
+								crossRange = max2 - min1
+							}
+
+							/*If there is a substantial cross-range, and the average difference between pixels in
+							the grid is substantial, then both remain.*/
+							if crossRange >= margInt {
+								/*Check to ensure neither grid has its darkest pixel too much above the brightest of
+								the other.*/
+								if (max2 < 255-margInt && min1 > max2+margInt) || (max1 < 255-margInt && min2 > max1+margInt) {
+									goto increment_shallow
+								}
+
+								sum := 0
+
+								/*The above sum, minus the sum of the differences of pixels
+								already calculated.*/
+								maxSum_diff := areaMarg
+
+								i_1 := g1_offset
+								end_1 := g1_offset + area_signed
+								end_l := end_1 - (area_signed % 4)
+								i_2 := g2.offset
+								cr := int(crossRange)
+								var diff, p1, p2 uint8
+								/*The product of the remaining number of pixels and the
+								cross-range between grids.*/
+								i_cr := area_signed * cr
+								/*The loop ends if the sum of the differences between
+								corresponding pixels exceeds the product of the area
+								and the margin OR if the sum plus the product of the
+								remaining pixels and the cross-range is less than this
+								total permitted sum, meaining that it is no longer
+								mathetmatically possible for the grids to have such
+								a great average distance. This tightrope balance
+								fixed a slowdown issue.
+								This is unrolled, examining four pixels a cycle.*/
+								for i_1 < end_l {
+									p1 = naphilArray[i_1]
+									p2 = naphilArray[i_2]
+									if p1 != p2 {
+										diff = p1 - p2
+										if p2 > p1 {
+											diff = p2 - p1
+										}
+										sum += int(diff)
+										maxSum_diff -= int(diff)
+									}
+									i_cr -= cr
+									i_1++
+									i_2++
+									p1 = naphilArray[i_1]
+									p2 = naphilArray[i_2]
+									if p1 != p2 {
+										diff = p1 - p2
+										if p2 > p1 {
+											diff = p2 - p1
+										}
+										sum += int(diff)
+										maxSum_diff -= int(diff)
+									}
+									i_cr -= cr
+									i_1++
+									i_2++
+									p1 = naphilArray[i_1]
+									p2 = naphilArray[i_2]
+									if p1 != p2 {
+										diff = p1 - p2
+										if p2 > p1 {
+											diff = p2 - p1
+										}
+										sum += int(diff)
+										maxSum_diff -= int(diff)
+									}
+									i_cr -= cr
+									i_1++
+									i_2++
+									p1 = naphilArray[i_1]
+									p2 = naphilArray[i_2]
+									if p1 != p2 {
+										diff = p1 - p2
+										if p2 > p1 {
+											diff = p2 - p1
+										}
+										sum += int(diff)
+										maxSum_diff -= int(diff)
+									}
+									i_cr -= cr
+									if sum > areaMarg {
+										goto increment_shallow
+									}
+									if i_cr < maxSum_diff {
+										goto coinToss_shallow
+									}
+									i_1++
+									i_2++
+								}
+								for i_1 < end_1 && i_cr < maxSum_diff {
+									p1 = naphilArray[i_1]
+									p2 = naphilArray[i_2]
+									if p1 != p2 {
+										diff = p1 - p2
+										if p2 > p1 {
+											diff = p2 - p1
+										}
+										sum += int(diff)
+										maxSum_diff -= int(diff)
+									}
+									if sum > areaMarg {
+										goto increment_shallow
+									}
+									i_1++
+									i_2++
+								}
+							}
+
+							/*If the grids are so similar that cross-range is not substantial or the average difference
+							is not substantial, randomly decide which stays and which goes.*/
+						coinToss_shallow:
+							if rBits%2 == 0 {
+								array[i].dimCornAvg |= 0xFF00000000000000
+								j = c4_marg_end
+							} else {
+								array[j].dimCornAvg |= 0xFF00000000000000
+							}
+							/*Instead of randomly generating a number only to use one of its bits each cointoss, a random
+							64-bit number is generated at the beginning of the loop, shifted each coinn-toss, and reset
+							whenever its bits run out.*/
+							rBits >>= 1
+							if rBits == 0 {
+								rBits = rand.Uint64()
+							}
+						}
+					increment_shallow:
+						j++
+						goto comparison_shallow
+					}
+				}
+				i++
+				goto loopStart_shallow
+			}
+		}(start, end)
+	}
+	wg.Wait()
+	if tNum > 1 {
+		loopDivs = make([]int, tNum+1)
+		loopDivs[0] = rangeCutoff
+		loopDivs[tNum] = arrayLen
+		for i := 1; i < tNum; i++ {
+			tempDiv := (i * (arrayLen - rangeCutoff) / tNum) + rangeCutoff
+			dims := (array[tempDiv].dimCornAvg >> 40) & 0xFFFF
+			if (array[tempDiv-1].dimCornAvg>>40)&0xFFFF == dims && (array[tempDiv+1].dimCornAvg>>40)&0xFFFF == dims {
+				a := loopDivs[i-1]
+				b := max(tempDiv-1, rangeCutoff)
+				var m int
+				for a < b {
+					m = a + ((b - a) / 2)
+					if (array[m].dimCornAvg>>40)&0xFFFF == dims {
+						b = m
+					} else {
+						a = m + 1
+					}
+				}
+				div1 := a
+				a = min(tempDiv+1, arrayLen)
+				b = arrayLen
+				for a < b {
+					m = a + ((b - a) / 2)
+					if (array[m].dimCornAvg>>40)&0xFFFF == dims {
+						a = m + 1
+					} else {
+						b = 1
+					}
+				}
+				div2 := a
+				if tempDiv-div1 > div2-tempDiv {
+					tempDiv = div2
+				} else {
+					tempDiv = div1
+				}
+			}
+			loopDivs[i] = tempDiv
+		}
+	}
+	/*Instead of determining average differences between grids, this checks the single greatest
+	difference between corresponding pixels.*/
+	wg = sync.WaitGroup{}
+	for i__ := range tNum {
+		var start, end int
+		if tNum > 1 {
+			start, end = loopDivs[i__], loopDivs[i__+1]
+		} else {
+			start, end = rangeCutoff, arrayLen
+		}
+		wg.Add(1)
+		go func(start, end int) {
+			defer wg.Done()
+			rBits := rand.Uint64()
+			i := start
+			w_curr := array[start].getW()
+			h_curr := array[start].getH()
+
+			area_signed := int(w_curr) * int(h_curr)
+
+			remainder_area := area_signed % 4
+
+			x_ := start + 1
+			y_ = end
+			var gTemp Grid
+			for x_ < y_ {
+				mid := x_ + ((y_ - x_) / 2)
+				gTemp = array[mid]
+				if gTemp.getW() != w_curr || gTemp.getH() != h_curr {
+					y_ = mid
+				} else {
+					x_ = mid + 1
+				}
+			}
+			dim_end := x_
+
+			/*Determining the last grids similar to the first grid in various aspects.*/
+			_, avg_end, avg_marg_end := findEndpoints(array, 0, 32, dim_end, m_64)
+			c1, c1_end, c1_marg_end := findEndpoints(array, 0, 24, avg_end, m_64)
+			c2, c2_end, c2_marg_end := findEndpoints(array, 0, 16, c1_end, m_64)
+			c3, c3_end, c3_marg_end := findEndpoints(array, 0, 8, c2_end, m_64)
+			c4, c4_end, c4_marg_end := findEndpoints(array, 0, 0, c3_end, m_64)
+
+			/*These are used to reset the above values below.*/
+			var new_c1_start, new_c1_end, new_c2_start, new_c2_end, new_c3_start, new_c3_end, new_avg_start, new_avg_end, j, new_j int
+
+			var g1 Grid
+
+			var breakLoop bool
+		loopStart_deep:
+			if i < end {
+				if tellTime && time.Now().Unix() > startTime {
+					fmt.Printf("%d	%d\n", i, j)
+					startTime = time.Now().Unix()
+				}
+				if array[i].dimCornAvg>>56 != 255 {
+					if i < c4_end {
+						g1 = array[i]
+						j = i + 1
+						goto comparison_deep
+					}
+					if i >= c3_end {
+						if i >= c2_end {
+							if i >= c1_end {
+								if i >= avg_end {
+									if i >= dim_end {
+										goto reset_dim_deep
+									}
+									goto reset_avg_deep
+								}
+								goto reset_c1_deep
+							}
+							goto reset_c2_deep
+						}
+						goto reset_c3_deep
+					}
+					goto reset_c4_deep
+				reset_dim_deep:
+					dims = (array[i].dimCornAvg >> 40) & 0xFFFF
+					x_ = i + 1
+					y_ = end
+					for x_ < y_ {
+						mid := x_ + ((y_ - x_) / 2)
+						gTemp = array[mid]
+						if (gTemp.dimCornAvg>>40)&0xFFFF <= dims {
+							x_ = mid + 1
+						} else {
+							y_ = mid
+						}
+					}
+					dim_end = x_
+					area_signed = int(dims & 255)
+					area_signed *= int((dims >> 8) & 255)
+				reset_avg_deep:
+					_, avg_end, avg_marg_end = findEndpoints(array, i, 32, dim_end, m_64)
+				reset_c1_deep:
+					c1, c1_end, c1_marg_end = findEndpoints(array, i, 24, avg_end, m_64)
+				reset_c2_deep:
+					c2, c2_end, c2_marg_end = findEndpoints(array, i, 16, c1_end, m_64)
+				reset_c3_deep:
+					c3, c3_end, c3_marg_end = findEndpoints(array, i, 8, c2_end, m_64)
+				reset_c4_deep:
+					c4, c4_end, c4_marg_end = findEndpoints(array, i, 0, c3_end, m_64)
+					if c4_marg_end > arrayLen {
+						c4_marg_end = arrayLen
+					}
+				comparison_deep:
+					if j < c4_marg_end {
+						if tellTime && time.Now().Unix() > startTime {
+							fmt.Printf("%d	%d\n", i, j)
+							startTime = time.Now().Unix()
+						}
+						if array[j].dimCornAvg>>56 != 255 {
+							g2 := array[j]
+							if g2.dimCornAvg-g1.dimCornAvg >= m_64 {
+								mis = gridMismatchCorn(g1.dimCornAvg&0xFFFFFFFF, g2.dimCornAvg&0xFFFFFFFF, m_64)
+								if mis != 0 {
+									/*The general algorithm for a mismatch is to find new endpoints
+									(including margin) for level above the mismatch, then at the level
+									of the mismatch and everthing downstream (excluding margin) before
+									stopping at the fourth corner.*/
+									if mis != 0 {
+										if mis == 1 {
+											goto check_1
+										} else if mis < 3 {
+											goto check_2
+										} else if mis < 4 {
+											goto check_3
+										} else {
+											goto check_4
+										}
+									check_1:
+										new_avg_start, new_avg_end, breakLoop = findNewEndpoints(array, i, j, 32, avg_marg_end)
+										if breakLoop {
+											j = c4_marg_end
+											goto increment_deep
+										}
+										new_c1_start, new_c1_end, c1_marg_end = findNewEndpointsMarg(array, new_avg_start, new_avg_end, 24, c1, m_64)
+										goto skip_2
+									check_2:
+										new_c1_start, new_c1_end, breakLoop = findNewEndpoints(array, i, j, 24, c1_marg_end)
+										if breakLoop {
+											j = c4_marg_end
+											goto increment_deep
+										}
+									skip_2:
+										new_c2_start, new_c2_end, c2_marg_end = findNewEndpointsMarg(array, new_c1_start, new_c1_end, 16, c2, m_64)
+										goto skip_3
+									check_3:
+										new_c2_start, new_c2_end, breakLoop = findNewEndpoints(array, i, j, 16, c2_marg_end)
+										if breakLoop {
+											j = c4_marg_end
+											goto increment_deep
+										}
+									skip_3:
+										new_c3_start, new_c3_end, c3_marg_end = findNewEndpointsMarg(array, new_c2_start, new_c2_end, 8, c3, m_64)
+										goto skip4
+									check_4:
+										new_c3_start, new_c3_end, breakLoop = findNewEndpoints(array, i, j, 8, c3_marg_end)
+										if breakLoop {
+											j = c4_marg_end
+											goto increment_deep
+										}
+									skip4:
+										new_j = binarySearchGridArray(array, new_c3_start, new_c3_end, 0, c4) - 1
+										if new_j >= j {
+											j = new_j
+										}
+										goto increment_deep
+									}
+								}
+							}
+							max1 := g1.maxLuma
+							max2 := g2.maxLuma
+							min1 := g1.minLuma
+							min2 := g2.minLuma
+							if min1 == min2 {
+								if max1 >= max2 {
+									crossRange = max1 - min1
+								} else {
+									crossRange = max2 - min1
+								}
+							} else if max1 == max2 {
+								if max1 < max2 {
+									crossRange = max1 - min1
+								} else {
+									crossRange = max1 - min2
+								}
+							} else {
+								crossRange = max(max2-min1, max1-min2)
+							}
+
+							if crossRange >= margInt {
+								var end_l int
+								var p1, p2, diff uint8
+								end_l = g1_offset + area_signed - remainder_area
+								i_1 := g1_offset
+								i_2 := g2.offset
+								/*This loop is unrolled, checking four pairs of pixels in a cycle.*/
+								for i_1 < end_l {
+									p1 = naphilArray[i_1]
+									p2 = naphilArray[i_2]
+									if p1 != p2 {
+										diff = p1 - p2
+										if p1 < p2 {
+											diff = p2 - p1
+										}
+										if diff >= margInt {
+											goto increment_deep
+										}
+									}
+									i_1++
+									i_2++
+									p1 = naphilArray[i_1]
+									p2 = naphilArray[i_2]
+									if p1 != p2 {
+										diff = p1 - p2
+										if p1 < p2 {
+											diff = p2 - p1
+										}
+										if diff >= margInt {
+											goto increment_deep
+										}
+									}
+									i_1++
+									i_2++
+									p1 = naphilArray[i_1]
+									p2 = naphilArray[i_2]
+									if p1 != p2 {
+										diff = p1 - p2
+										if p1 < p2 {
+											diff = p2 - p1
+										}
+										if diff >= margInt {
+											goto increment_deep
+										}
+									}
+									i_1++
+									i_2++
+									p1 = naphilArray[i_1]
+									p2 = naphilArray[i_2]
+									if p1 != p2 {
+										diff = p1 - p2
+										if p1 < p2 {
+											diff = p2 - p1
+										}
+										if diff >= margInt {
+											goto increment_deep
+										}
+									}
+									i_1++
+									i_2++
+								}
+								if remainder_area != 0 {
+									p1 = naphilArray[i_1]
+									p2 = naphilArray[i_2]
+									if p1 != p2 {
+										diff = p1 - p2
+										if p1 < p2 {
+											diff = p2 - p1
+										}
+										if diff >= margInt {
+											goto increment_deep
+										}
+									}
+									if remainder_area > 1 {
+										i_1++
+										i_2++
+										p1 = naphilArray[i_1]
+										p2 = naphilArray[i_2]
+										if p1 != p2 {
+											diff = p1 - p2
+											if p1 < p2 {
+												diff = p2 - p1
+											}
+											if diff >= margInt {
+												goto increment_deep
+											}
+										}
+										if remainder_area > 2 {
+											i_1++
+											i_2++
+											p1 = naphilArray[i_1]
+											p2 = naphilArray[i_2]
+											if p1 != p2 {
+												diff = p1 - p2
+												if p1 < p2 {
+													diff = p2 - p1
+												}
+												if diff >= margInt {
+													goto increment_deep
+												}
+											}
+										}
+									}
+								}
+							}
+
+							if rBits%2 == 0 {
+								array[i].dimCornAvg |= 0xFF00000000000000
+								j = c4_marg_end
+							} else {
+								array[j].dimCornAvg |= 0xFF00000000000000
+							}
+							rBits >>= 1
+							if rBits == 0 {
+								rBits = rand.Uint64()
+							}
+						}
+					increment_deep:
+						j++
+						goto comparison_deep
+					}
+				}
+				i++
+				goto loopStart_deep
+			}
+		}(start, end)
 	}
 	wg.Wait()
 
-	/*Shuffle around the grids so that all the remaining ones are at
-	the beginning and all eliminated ones are at the end.*/
-	restructuredBoolArray(boolArray, boolLen, array, arrayLen)
-	return array
-}
+	var max_64 uint64
+	max_64 = math.MaxUint64
 
-/*This generates a grid from a fragment of a monochrome image.*/
-func gridFromImg(img [][]uint8, x1 uint32, x2 uint32, y1 uint32, y2 uint32) Grid {
-	if x1 == x2 || y1 == y2 {
-		panic("Empty grid produced during extraction process")
+	eliminated_shallow_64 := uint64(0)
+	for i := range rangeCutoff {
+		eliminated_shallow_64 += ((array[i].dimCornAvg >> 56) / 255)
 	}
-
-	/*Swap coordinates in order to avoid underflow*/
-	if x1 > x2 {
-		x1, x2 = x2, x1
-	}
-	if y1 > y2 {
-		y1, y2 = y2, y1
-	}
-
-	if x2-x1 > 255 || y2-y1 > 255 {
-		panic("Dimensions above 255 not supported")
-	}
-
-	w := uint8(x2 - x1)
-	h := uint8(y2 - y1)
-	h32 := uint32(h)
-	w32 := uint32(w)
-
-	g := Grid{
-		w:     w,
-		h:     h,
-		array: make([][]uint8, w),
-	}
-
-	for i := range g.array {
-		g.array[i] = make([]uint8, h)
-	}
-
-	maxLuma := uint8(0)
-	minLuma := uint8(255)
-	sum := uint32(0)
-
-	/*Get a pixel from the image, determine whether
-	it is higher or lower than previous pixels, add
-	it to the sum, and then place it into the grid.*/
-	for i := uint32(0); i < w32; i++ {
-		for j := uint32(0); j < h32; j++ {
-			p := img[x1+i][y1+j]
-			if p > maxLuma {
-				maxLuma = p
-			}
-			if p < minLuma {
-				minLuma = p
-			}
-			sum += uint32(p)
-			g.array[i][j] = p
+	remaining_shallow := rangeCutoff - int(eliminated_shallow_64)
+	resettled_shallow := 0
+	var i = 0
+	var j int
+	/*These loops "yanks" all remaining grids towards the front*/
+	for i < rangeCutoff-1 && resettled_shallow < remaining_shallow {
+		if array[i].dimCornAvg>>56 != 255 {
+			i++
+		} else if j < i {
+			j = i + 1
+		} else if array[j].dimCornAvg>>56 == 255 {
+			j++
+		} else {
+			array[i].w__ = array[j].w__
+			array[i].h__ = array[j].h__
+			array[i].offset = array[j].offset
+			array[i].avgLuma = array[j].avgLuma
+			array[i].minLuma = array[j].minLuma
+			array[i].maxLuma = array[j].maxLuma
+			array[i].coord = array[j].coord
+			array[i].dimCornAvg = array[j].dimCornAvg
+			array[j].dimCornAvg = max_64
+			resettled_shallow++
+			i++
+			j++
 		}
 	}
 
-	g.maxLuma = maxLuma
-	g.minLuma = minLuma
-	g.avgLuma = uint8(sum / (h32 * w32))
+	eliminated_deep_64 := uint64(0)
+	for i := rangeCutoff; i < arrayLen; i++ {
+		eliminated_deep_64 += ((array[i].dimCornAvg >> 56) / 255)
+	}
+	remaining_deep := arrayLen - rangeCutoff - int(eliminated_deep_64)
+	resettled_deep := 0
+	j = rangeCutoff
+	for i < arrayLen-1 && resettled_deep < remaining_deep {
+		if array[i].dimCornAvg>>56 != 255 {
+			i++
+		} else if j < i {
+			j = i + 1
+		} else if array[j].dimCornAvg>>56 == 255 {
+			j++
+		} else {
+			array[i].w__ = array[j].w__
+			array[i].h__ = array[j].h__
+			array[i].offset = array[j].offset
+			array[i].avgLuma = array[j].avgLuma
+			array[i].minLuma = array[j].minLuma
+			array[i].maxLuma = array[j].maxLuma
+			array[i].coord = array[j].coord
+			array[i].dimCornAvg = array[j].dimCornAvg
+			array[j].dimCornAvg = max_64
+			resettled_deep++
+			i++
+			j++
+		}
+	}
+	/*This erases all eliminated grids*/
+	array = array[:resettled_deep+resettled_shallow]
 
-	return g
+	return array
 }
 
 /*
 Get the xy coordinates from a tree in order to
 create grids.
 */
-func coordsFromTree(t *Tree, coordArray [][]uint32, index uint32) {
+func coordsFromTree(t *Tree, imageIndex uint64, coordArray [][]uint64, index int, reuse []uint64) {
 	/*If the tree is in fact a leaf, it place its
 	coordinates into the array*/
 	if t.hasChildren == 0 {
+		if index >= len(coordArray) {
+			panic("Out of bounds")
+		}
 		if coordArray[index] != nil && len(coordArray[index]) != 0 {
 			panic("Already set\n")
 		}
-		coordArray[index] = make([]uint32, 4)
-		coordArray[index][0] = t.x1
-		coordArray[index][1] = t.x2
-		coordArray[index][2] = t.y1
-		coordArray[index][3] = t.y2
+		reuse[0] = t.x1
+		reuse[1] = t.x2
+		reuse[2] = t.y1
+		reuse[3] = t.y2
+		reuse[4] = imageIndex
+		coordArray[index] = make([]uint64, 5)
+		copy(coordArray[index], reuse)
 		return
 	}
 	/*Otherwise, find leaves while offsetting the index when
 	appropriate.*/
 	if t.hasChildren&1 != 0 {
-		coordsFromTree(t.rTree, coordArray, index)
+		coordsFromTree(t.rTree, imageIndex, coordArray, index, reuse)
 	}
-	if (t.hasChildren>>1)&1 != 0 {
-		coordsFromTree(t.lTree, coordArray, index+uint32(t.rTree.leafNum))
+	if (t.hasChildren)&2 != 0 {
+		coordsFromTree(t.lTree, imageIndex, coordArray, index+t.rTree.leafNum, reuse)
 	}
 }
 
-/*Get the coordinates from an array of images along with
-a corresponding array of trees.*/
-/*Making an array with a predefined size after receiving
-all images reduces garbage collection time.*/
-func gridsFromCoords(img [][][]uint8, trees []*Tree) []Grid {
-	/*The total numebr of leaves will determine the number of coordinate sets.*/
-	totalLeafNum := 0
-	for i := 0; i < len(trees); i++ {
-		totalLeafNum += trees[i].leafNum
-	}
-
-	/*Create an array of coorindates and populate them based on the trees.*/
-	coordArray := make([][]uint32, totalLeafNum)
-	tempLeafNum := uint32(0)
-	for i := 0; i < len(trees); i++ {
-		coordsFromTree(trees[i], coordArray, tempLeafNum)
-		l := uint32(trees[i].leafNum)
-		tempLeafNum += l
-	}
-
-	/*Create and populate the grid array based on the coordinates*/
-	gridArray := make([]Grid, totalLeafNum)
-	tempLeafNum = 0
-	start = time.Now().UnixNano()
-	for i := 0; i < len(img); i++ {
-		leafNum := uint32(trees[i].leafNum)
-		for j := uint32(0); j < leafNum; j++ {
-			gridArray[tempLeafNum+j] = gridFromImg(img[i], coordArray[tempLeafNum+j][0], coordArray[tempLeafNum+j][1], coordArray[tempLeafNum+j][2], coordArray[tempLeafNum+j][3])
-		}
-		tempLeafNum += leafNum
-	}
-	return gridArray
-}
-
-/*This adds a grid and its coordinates in an image to a map.*/
-func mapFromTree(gridMap map[uint32]Grid, img [][]uint8, t *Tree) map[uint32]Grid {
+func encodeCoords(t *Tree, imageIndex uint64, encodedCoords []uint64, index int) {
+	/*If the tree is in fact a leaf, it place its
+	coordinates into the array*/
 	if t.hasChildren == 0 {
-		gridMap[(t.x1<<16)|(t.y1&65535)] = gridFromImg(img, t.x1, t.x2, t.y1, t.y2)
+		if index >= len(encodedCoords) {
+			panic("Out of bounds")
+		}
+		if encodedCoords[index] != 0 {
+			panic("Already set\n")
+		}
+		/*Encode the index of the image from the array*/
+		enc := imageIndex
+		/*Encode the width*/
+		enc <<= 8
+		enc += ((t.x2 - t.x1) & 255)
+		/*Encode the height*/
+		enc <<= 8
+		enc += ((t.y2 - t.y1) & 255)
+		enc <<= 13
+		/*Encode the leftmost x-coordinate*/
+		if t.x1 > 8191 {
+			panic("Invalid coordinate")
+		}
+		enc += ((^t.x1) & 8191)
+		/*Encode the top y-coordinate*/
+		enc <<= 13
+		if t.y1 > 8191 {
+			panic("Invalid coordinate")
+		}
+		enc += ((^t.y1) & 8191)
+		encodedCoords[index] = enc
+		return
 	}
+	/*Otherwise, find leaves while offsetting the index when
+	appropriate.*/
 	if t.hasChildren&1 != 0 {
-		gridMap = mapFromTree(gridMap, img, t.rTree)
+		encodeCoords(t.rTree, imageIndex, encodedCoords, index)
 	}
-	if (t.hasChildren>>1)&1 != 0 {
-		gridMap = mapFromTree(gridMap, img, t.lTree)
+	if (t.hasChildren)&2 != 0 {
+		encodeCoords(t.lTree, imageIndex, encodedCoords, index+t.rTree.leafNum)
 	}
-	return gridMap
 }
 
-/*
-This finds the first cursor in a grid array that fits one aspect of
-a grid used as a search term.
-*/
-func firstCursor(array []Grid, g Grid, key uint8, n1 uint32, n2 uint32) uint32 {
-	/*
-		0	w
-		1	h
-		2	w+1
-		3	h+1
-		4	avgLuma
-		5	whole grid
-	*/
-	for n1 < n2 {
-		m := uint32((n1 + n2) / 2)
-		if (key == 0 && array[m].w >= g.w) ||
-			(key == 1 && array[m].w >= g.w+1) ||
-			(key == 2 && array[m].h >= g.h) ||
-			(key == 3 && array[m].h >= g.h+1) ||
-			(key == 4 && array[m].avgLuma >= g.avgLuma) ||
-			(key == 5 && lessGrid(g, array[m], false)) {
-			n2 = m
-		} else {
-			n1 = m + 1
-		}
-	}
-	return n1
-}
+func lumaTrace(imgW int, imgH int, pix_data []uint8, array []Grid, arrayLen int, t *Tree, naphilArrayIn []uint8) []uint8 {
+	tellTime := false
 
-/*
-This function breaks down an image into individual parts and traces them into a new image
-using the most similar fragments of images previously processed. It is the primary reason
-this program exists.
-*/
-func lumaTrace(img [][]uint8, ymg [][]uint8, array []Grid, arrayLen uint32, t *Tree) [][]uint8 {
-	gridMap := make(map[uint32]Grid)
-	/*This takes in an image (or a monochrome representation of one) along with a tree to
-	subdivide it, and puts the grids created from the subdivisions and their coordinates in
-	a map.*/
-	gridMap = mapFromTree(gridMap, img, t)
-	/*This stores the top-right corner of every grid.*/
-	keys := make([]uint32, t.leafNum)
-	kLen := 0
-	for key := range gridMap {
-		keys[kLen] = key
-		kLen++
+	/*Initialize array to store the output data*/
+	pix_data_out := make([]uint8, imgW*imgH)
+
+	/*Create an array of coordinates based off the tree*/
+	coordArray := make([][]uint64, t.leafNum)
+
+	reuse := make([]uint64, 5)
+	l := t.leafNum
+	coordsFromTree(t, 0, coordArray, 0, reuse)
+
+	/*Sort the coordinates*/
+	sort.Slice(coordArray, func(i, j int) bool {
+		return coordArray[i][1]-coordArray[i][0] < coordArray[j][1]-coordArray[j][0] || (coordArray[i][1]-coordArray[i][0] == coordArray[j][1]-coordArray[j][0] && coordArray[i][3]-coordArray[i][2] < coordArray[j][3]-coordArray[j][2])
+	})
+
+	/*Create an array of indices to a naphil array*/
+	tempIndex := 0
+
+	indexArray := make([]int, l)
+
+	i_ := 0
+
+	var startTemp int64
+	if tellTime {
+		startTemp = time.Now().Unix()
 	}
-	/*This sorts the coordinates such that the earlier entries refer to those grids which
-	would be sorted earlier (because of being narrow, short, or dark on average).*/
-	sort.SliceStable(keys, func(i, j int) bool { return lessGrid(gridMap[keys[i]], gridMap[keys[j]], false) })
-	/*This finds the entry in the array that is as short, narrow, and dark as the shortest,
-	narrowest, and darkest grid in the map.*/
-	w1 := firstCursor(array, gridMap[keys[0]], 0, 0, uint32(len(array)))
-	w2 := firstCursor(array, gridMap[keys[0]], 1, w1, uint32(len(array)))
-	h1 := firstCursor(array, gridMap[keys[0]], 2, w1, w2)
-	h2 := firstCursor(array, gridMap[keys[0]], 3, h1, w2)
-	a := firstCursor(array, gridMap[keys[0]], 5, h1, h2)
-	/*This parameterizes the dimensions of the grid, which will be used often in the following
-	loop.*/
-	gw := gridMap[keys[0]].w
-	gh := gridMap[keys[0]].h
-	aw, ah := gw, gh
-	for i := 0; i < t.leafNum; i++ {
-		if 1000000000 < time.Now().UnixNano()-start {
-			fmt.Printf("%f%%\n", 100.0*float64(i)/float64(t.leafNum))
-			start = time.Now().UnixNano()
+
+	/*Populate the index array*/
+	for i_ < l {
+		if tellTime && time.Now().Unix() > startTemp {
+			fmt.Printf("Setting index values	%f%%\n", 100.0*float64(i_)/float64(l))
+			startTemp = time.Now().Unix()
 		}
-		g := gridMap[keys[i]]
-		gw = g.w
-		gh = g.h
-		/*This loop restricts its search to just those grids from the array that are
-		the same dimensions as the one from the map currently being examined. The
-		dimensions from the array are reparameterized at the end and the ones from
-		the map at the beginning, allowing for a mismatch to be found. If that is the
-		case, the following if statement readjusts the endpoints for the search terms.*/
-		if aw != gw || ah != gh {
-			h_a := w1
-			h_b := w2
-			if gw != aw {
-				if aw < gw {
-					w2 = firstCursor(array, g, 1, a, uint32(len(array)))
-					w1 = firstCursor(array, g, 0, a, w2)
-				} else {
-					w1 = firstCursor(array, g, 0, 0, a)
-					w2 = firstCursor(array, g, 1, w1, a)
-				}
-				h_a = w1
-				h_b = w2
+		area := int(coordArray[i_][1]-coordArray[i_][0]) * int(coordArray[i_][3]-coordArray[i_][2])
+		a := i_ + 1
+		b := l
+		for a < b {
+			m := a + ((b - a) / 2)
+			if coordArray[m][1]-coordArray[m][0] == coordArray[i_][1]-coordArray[i_][0] && coordArray[m][3]-coordArray[m][2] == coordArray[i_][3]-coordArray[i_][2] {
+				a = m + 1
 			} else {
-				if ah < gh {
-					h_a = a
-				} else {
-					h_b = a
-				}
-			}
-			h1 = firstCursor(array, g, 2, h_a, h_b)
-			h2 = firstCursor(array, g, 3, h1, h_b)
-			a = firstCursor(array, g, 5, h1, h2)
-		}
-		if a >= arrayLen {
-			a = arrayLen - 1
-		}
-		minDiffC := a
-		minDiffInt := uint8(gridDiff(array[a], g) / (uint32(g.w) * uint32(g.h)))
-		/*The program guesses based on previous information and restricts
-		its search to grids that have a mathematic possibility of being
-		more accurate.*/
-		l1 := h1
-		if g.avgLuma > minDiffInt {
-			n1 := h1
-			n2 := h2
-			for n1 < n2 {
-				m := uint32((n1 + n2) / 2)
-				if array[m].avgLuma > g.avgLuma-minDiffInt {
-					n2 = m
-				} else {
-					n1 = m + 1
-				}
-			}
-			l1 = n1
-		}
-		l2 := h2
-		if g.avgLuma < 255-minDiffInt {
-			n1 := l1
-			n2 := h2
-			for n1 < n2 {
-				m := uint32((n1 + n2) / 2)
-				if array[m].avgLuma > g.avgLuma+minDiffInt {
-					n2 = m
-				} else {
-					n1 = m + 1
-				}
-			}
-			l2 = n2
-		}
-		if l2 >= arrayLen {
-			l2 = arrayLen - 1
-		}
-		for k := int(a); k >= int(l1) && k >= 0; k-- {
-			if byteAbsDiff(g.avgLuma, array[k].avgLuma) < minDiffInt && (g.maxLuma > 255-minDiffInt || array[k].minLuma < g.maxLuma+minDiffInt) && (array[k].maxLuma > 255-minDiffInt || g.minLuma < array[k].maxLuma+minDiffInt) {
-				crossRange := getCrossRange(array[k], g)
-				var diffTemp uint32
-				if crossRange >= minDiffInt {
-					diffTemp = gridDiffAlt(array[k], g, minDiffInt)
-				} else {
-					diffTemp = uint32(crossRange) * uint32(g.w) * uint32(g.h)
-				}
-				if diffTemp < uint32(minDiffInt)*uint32(g.w)*uint32(g.h) {
-					minDiffInt = uint8(diffTemp / (uint32(g.w) * uint32(g.h)))
-					minDiffC = uint32(k)
-				}
+				b = m
 			}
 		}
-		for k := a + 1; k < l2; k++ {
-			if byteAbsDiff(g.avgLuma, array[k].avgLuma) < minDiffInt && (g.maxLuma > 255-minDiffInt || array[k].minLuma < g.maxLuma+minDiffInt) && (array[k].maxLuma > 255-minDiffInt || g.minLuma < array[k].maxLuma+minDiffInt) {
-				crossRange := getCrossRange(array[k], g)
-				var diffTemp uint32
-				if crossRange >= minDiffInt {
-					diffTemp = gridDiffAlt(array[k], g, minDiffInt)
-				} else {
-					diffTemp = uint32(crossRange) * uint32(g.w) * uint32(g.h)
-				}
-				if diffTemp < uint32(minDiffInt)*uint32(g.w)*uint32(g.h) {
-					minDiffInt = uint8(diffTemp / (uint32(g.w) * uint32(g.h)))
-					minDiffC = k
-				}
-			}
+		z := a
+		j_ := i_
+		for j_ < z {
+			indexArray[j_] = tempIndex
+			tempIndex += area
+			j_++
 		}
-		/*The coordinates are stored in the map, in a way involving bitwise operations. This simply
-		reverses those operations to get separate x and y values.*/
-		x1 := keys[i] >> 16
-		x2 := x1 + uint32(gw)
-		y1 := keys[i] & 65535
-		y2 := y1 + uint32(gh)
-		for x := x1; x < x2; x++ {
-			if int(x) > len(ymg) || minDiffC > uint32(len(array)) || int(x-x1) > len(array[minDiffC].array) {
-				panic("Variables pointing to outside the array produced during luma trace.")
-			}
-			copy(ymg[x][y1:y2], array[minDiffC].array[x-x1])
-		}
-		/*This uses the index of the most similar grid from this iteration of the loop as a guess for
-		the next time.*/
-		a = minDiffC
-		aw = array[a].w
-		ah = array[a].h
+		i_ = z
 	}
-	return ymg
+
+	/*Create the naphil array which will store the same data as pix_data
+	in a different arrangement, grid-by-grid.*/
+	naphilArrayTrace := make([]uint8, imgW*imgH)
+
+	/*Array of grids from the iamge*/
+	coordinatedArray := make([]Grid, l)
+
+	if tellTime {
+		startTemp = time.Now().Unix()
+	}
+	/*Populate the grid array*/
+	for i := range l {
+		if tellTime && time.Now().Unix() > startTemp {
+			fmt.Printf("Generating grids in traced image	%f%%\n", 100.0*float64(i_)/float64(l))
+			startTemp = time.Now().Unix()
+		}
+
+		/*Gather the coordinates, calculate dimensions*/
+		ca := coordArray[i]
+		x1 := ca[0]
+		x2 := ca[1]
+		y1 := ca[2]
+		y2 := ca[3]
+		gw := int(x2 - x1)
+		gh := int(y2 - y1)
+		area := gw * gh
+
+		/*Get offset data*/
+		offset := indexArray[i]
+
+		/*Place the proper data into the naphil array*/
+		populateNaphil(naphilArrayTrace, pix_data, x1, x2, y1, y2, offset, uint64(imgW))
+
+		/*Get the minimum, maximum, and sum of the pixels in the grid*/
+		sum := uint64(0)
+		j := offset
+		end := offset + area
+		maxLuma := slices.Max(naphilArrayTrace[offset:end])
+		minLuma := slices.Min(naphilArrayTrace[offset:end])
+		for j < end {
+			sum += uint64(naphilArrayTrace[j])
+			j++
+		}
+
+		dimCornAvg := uint64(0)
+		dimCornAvg += uint64(gw)
+		dimCornAvg <<= 8
+		dimCornAvg += uint64(gh)
+		dimCornAvg <<= 8
+		dimCornAvg += (sum / uint64(area))
+		dimCornAvg <<= 8
+		dimCornAvg += uint64(maxLuma - minLuma)
+		dimCornAvg <<= 8
+		dimCornAvg += uint64(maxLuma)
+		dimCornAvg <<= 16
+		coordinatedArray[i] = Grid{
+			w__:        uint8(gw),
+			h__:        uint8(gh),
+			avgLuma:    uint8(sum / uint64(area)),
+			minLuma:    minLuma,
+			maxLuma:    maxLuma,
+			dimCornAvg: dimCornAvg,
+			coord:      (uint64(y1) << 13) + uint64(x1),
+			offset:     offset,
+		}
+	}
+
+	/*Sort the grids*/
+	i_ = 0
+
+	if tellTime {
+		startTemp = time.Now().Unix()
+	}
+	for i_ < l {
+		if tellTime && time.Now().Unix() > startTemp {
+			fmt.Printf("Sorting grids	%f%%\n", 100.0*float64(i_)/float64(l))
+			startTemp = time.Now().Unix()
+		}
+
+		a := i_ + 1
+		b := l
+		for a < b {
+			m := a + ((b - a) / 2)
+			if coordinatedArray[m].getW() == coordinatedArray[i_].getW() && coordinatedArray[m].getH() == coordinatedArray[i_].getH() {
+				a = m + 1
+			} else {
+				b = m
+			}
+		}
+		sort.Slice(coordinatedArray[i_:a], func(i, j int) bool {
+			return coordinatedArray[i_+i].dimCornAvg < coordinatedArray[i_+j].dimCornAvg
+		})
+		i_ = a
+	}
+
+	dim_cursor := 0
+	dim_start_data := 0
+
+	var gridLoopTime int64
+	if tellTime {
+		gridLoopTime = time.Now().Unix()
+	}
+	/*Start the trace, grid-by-grids*/
+	for dim_cursor < l {
+		/*Dimensions of the grid at the current cursor*/
+		gw := coordinatedArray[dim_cursor].getW()
+		gh := coordinatedArray[dim_cursor].getH()
+		area := int(gw) * int(gh)
+		area_32 := uint32(area)
+
+		/*The last grid with the same dimensions*/
+		a := dim_cursor
+		b := l
+		if tellTime {
+			startTemp = time.Now().Unix()
+		}
+		for a < b {
+			if tellTime && time.Now().Unix() > startTemp {
+				fmt.Printf("Setting boundaries based on dimensions	%f%%\n", 100.0*float64(l-(a*b))/float64(l))
+				startTemp = time.Now().Unix()
+			}
+			m := a + ((b - a) / 2)
+			if coordinatedArray[m].getW() == gw && coordinatedArray[m].getH() == gh {
+				a = m + 1
+			} else {
+				b = m
+			}
+		}
+		dim_end := a
+
+		/*The last grid with the same dimensions from the dataset*/
+		a = dim_start_data
+		b = arrayLen
+		if tellTime {
+			startTemp = time.Now().Unix()
+		}
+		for a < b {
+			if tellTime && time.Now().Unix() > startTemp {
+				fmt.Printf("Setting boundaries based on dimensions	%f%%\n", 100.0*float64(arrayLen-(a*b))/float64(arrayLen))
+				startTemp = time.Now().Unix()
+			}
+			m := a + ((b - a) / 2)
+			if array[m].getW() == gw && array[m].getH() == gh {
+				a = m + 1
+			} else {
+				b = m
+			}
+		}
+		dim_end_data := a
+
+		i := dim_cursor
+		for i < dim_end {
+			if tellTime && time.Now().Unix() > gridLoopTime+10 {
+				fmt.Printf("Matching grids	%f%%\n", 100.0*float64(i)/float64(l))
+				gridLoopTime = time.Now().Unix()
+			}
+			/*Getting the offset of the grid and its pixels*/
+			g := coordinatedArray[i]
+			g_offset := g.offset
+			g_offset_end := g_offset + area
+			g_min := g.minLuma
+			g_max := g.maxLuma
+
+			/*The first and last grids in the dataset with
+			identical metadata (if any)*/
+			a := dim_start_data
+			b := dim_end_data
+			var start, end int
+			for a < b {
+				m := a + ((b - a) / 2)
+				if array[m].dimCornAvg < g.dimCornAvg {
+					a = m + 1
+				} else {
+					b = m
+				}
+			}
+			start = a
+			b = dim_end_data
+			for a < b {
+				m := a + ((b - a) / 2)
+				if array[m].dimCornAvg > g.dimCornAvg {
+					b = m
+				} else {
+					a = m + 1
+				}
+			}
+			end = a
+
+			var minDiff_8, g_avg uint8
+			var minDiffC int
+			var p Grid
+			j := start
+
+			/*If there are data grids with identical metadata to the
+			trace grid, compare them.*/
+			minDiff_32 := 255 * area_32
+			if start != end {
+				for j < end {
+					if tellTime && time.Now().Unix() > startTemp {
+						fmt.Printf("Looking for best match among similar grids	%f%%\n", 100.0*float64(j-start)/float64(end-start))
+						startTemp = time.Now().Unix()
+					}
+					p = array[j]
+					diffTemp := gridDiffNaphil(p, minDiff_32, naphilArrayIn, naphilArrayTrace, area, g_min, g_max, g_offset, g_offset_end)
+					if diffTemp < minDiff_32 {
+						minDiff_32 = diffTemp
+						minDiffC = j
+						if minDiff_32 == 0 {
+							break
+						}
+					}
+					j++
+				}
+			}
+			g_avg = g.avgLuma
+			minDiff_8 = uint8(minDiff_32 / area_32)
+			var avg_end, avg_start int
+			var diffTemp_32 uint32
+			/*If there are data grids with larger ranges but are
+			still potentially similar to the trace grids, compare them.*/
+			if end < dim_end_data {
+				/*Check for the last of these.*/
+				if minDiff_8 != 255 && g_avg < 255-minDiff_8 {
+					a = end
+					b = dim_end_data
+					for a < b {
+						m := a + ((b - a) / 2)
+						if array[m].avgLuma > g_avg+minDiff_8 {
+							b = m
+						} else {
+							a = m + 1
+						}
+					}
+					avg_end = a
+				} else {
+					avg_end = dim_end_data
+				}
+				j = end
+				for j < avg_end {
+					if tellTime && time.Now().Unix() > startTemp {
+						fmt.Printf("Looking for best match among similar grids with higher chromatic diversity	%f%%\n", 100.0*float64(j-end)/float64(avg_end-end))
+						startTemp = time.Now().Unix()
+					}
+					p = array[j]
+					diffTemp_32 = gridDiffNaphil(p, minDiff_32, naphilArrayIn, naphilArrayTrace, area, g_min, g_max, g_offset, g_offset_end)
+					/*Every time a more similar grid is found, restrict the search.*/
+					if diffTemp_32 < minDiff_32 {
+						minDiff_32 = diffTemp_32
+						minDiffC = j
+						tempDiff := uint8(minDiff_32 / area_32)
+						if tempDiff < minDiff_8 {
+							minDiff_8 = tempDiff
+							if g_avg < 255-minDiff_8 && j+1 < avg_end {
+								a = j + 1
+								b = avg_end
+								for a < b {
+									m := a + ((b - a) / 2)
+									if array[m].avgLuma >= g_avg+minDiff_8 {
+										b = m
+									} else {
+										a = m + 1
+									}
+								}
+								avg_end = a
+							}
+						}
+					}
+					j++
+
+				}
+			}
+			/*Peform similarly for grids with lower ranges*/
+			if start > dim_start_data {
+				if minDiff_8 != 255 && g_avg > minDiff_8 {
+					a = dim_start_data
+					b = start
+					for a < b {
+						m := a + ((b - a) / 2)
+						if array[m].avgLuma >= g_avg-minDiff_8 {
+							b = m
+						} else {
+							a = m + 1
+						}
+					}
+					avg_start = a
+				} else {
+					avg_start = dim_start_data
+				}
+				j = start - 1
+				for j >= avg_start {
+					if tellTime && time.Now().Unix() > startTemp {
+						fmt.Printf("Looking for best match among similar grids with higher chromatic diversity	%f%%\n", 100.0*float64(j-end)/float64(avg_end-end))
+						startTemp = time.Now().Unix()
+					}
+					p = array[j]
+					diffTemp_32 = gridDiffNaphil(p, minDiff_32, naphilArrayIn, naphilArrayTrace, area, g_min, g_max, g_offset, g_offset_end)
+
+					if diffTemp_32 < minDiff_32 {
+						minDiff_32 = diffTemp_32
+						minDiffC = j
+						tempDiff := uint8(minDiff_32 / area_32)
+						if tempDiff < minDiff_8 {
+							minDiff_8 = tempDiff
+							if g_avg > minDiff_8 && j-1 > avg_start {
+								a = avg_start
+								b = j - 1
+								for a < b {
+									m := a + ((b - a) / 2)
+									if array[m].avgLuma >= g_avg-minDiff_8 {
+										b = m
+									} else {
+										a = m + 1
+									}
+								}
+								avg_end = a
+							}
+						}
+					}
+					j--
+
+				}
+			}
+
+			w_signed := int(gw)
+
+			x1 := int(g.coord & 8191)
+			x2 := x1 + w_signed
+			y1 := int((g.coord >> 13) & 8191)
+			y2 := y1 + int(gh)
+
+			kOffset := array[minDiffC].offset
+
+			y := y1
+			y_offset := 0
+			if tellTime {
+				startTemp = math.MaxInt64
+			}
+			/*Trace this grid's segment of the image.*/
+			for y < y2 {
+				if tellTime && time.Now().Unix() > startTemp {
+					fmt.Printf("Populating the output pixel data	%f%%\n", 100.0*float64(y-y1)/float64(y2-y1))
+					startTemp = time.Now().Unix()
+				}
+				offset_n := kOffset + (y_offset * w_signed)
+				offset_p := (y * imgW)
+				end := offset_p + x2
+				offset_p += x1
+				if offset_n >= len(naphilArrayIn) || offset_n+w_signed > len(naphilArrayIn) {
+					panic("Out of bounds")
+				}
+				seq := naphilArrayIn[offset_n : offset_n+w_signed]
+				if offset_p >= len(pix_data_out) || end > len(pix_data_out) {
+					panic("Out of bounds")
+				}
+				copy(pix_data_out[offset_p:end], seq)
+				y++
+				y_offset++
+			}
+
+			i++
+		}
+		dim_cursor = dim_end
+		dim_start_data = dim_end_data
+	}
+
+	return pix_data_out
 }
 
 /*Read a grid array from a file.*/
-func readFromFile(fName string) ([]Grid, error) {
+func readFromFile(fName string) ([]Grid, []uint8, error) {
+	var maxLuma, minLuma uint8
 	f, err := os.Open(fName)
 	if nil != err {
 		fmt.Println(err)
-		return nil, err
+		return nil, nil, err
 	}
 	defer f.Close()
-	br := bufio.NewReader(f)
-	/*Generate a six-byte string with the little-endian size*/
-	sizeStr := make([]uint8, 6)
-	for i := 0; 6 > i; i++ {
-		sStr, err := br.ReadByte()
-		if nil != err {
-			fmt.Println(err)
-			return nil, err
-		}
-		sizeStr[5-i] = sStr
+
+	fStat, err := f.Stat()
+	if err != nil {
+		panic("Error getting statistical information of file")
 	}
-	/*Calculate the size*/
-	size := 0
-	for i := 0; 6 > i; i++ {
-		size = (size * 256) + int(sizeStr[i])
+	fileSize := fStat.Size()
+
+	reader := bufio.NewReader(f)
+
+	naphilArray := make([]uint8, fileSize)
+
+	_, err = io.ReadFull(reader, naphilArray)
+	if nil != err {
+		fmt.Println(err)
+		return nil, nil, err
 	}
-	/*For each grid, get the width, height, and pixel data, one-by-one.*/
-	array := make([]Grid, size)
-	for i := 0; i < size; i++ {
-		w, err := br.ReadByte()
-		if nil != err {
-			fmt.Println(err)
-			return nil, err
-		}
-		h, err := br.ReadByte()
-		if nil != err {
-			fmt.Println(err)
-			return nil, err
-		}
-		if w != 0 && h != 0 {
-			g := Grid{
-				w:       w,
-				h:       h,
-				avgLuma: 128,
-				medLuma: 0,
-				maxLuma: 0,
-				minLuma: 255,
-				array:   [][]uint8{},
-				sum:     0,
-			}
-			sum := uint32(0)
-			g.array = make([][]uint8, w)
-			var x, p uint8
-			for x = 0; x < w; x++ {
-				g.array[x] = make([]uint8, h)
-				for y := byte(0); y < h; y++ {
-					p, err = br.ReadByte()
-					if nil != err {
-						fmt.Println(err)
-						return nil, err
-					}
-					if p > g.maxLuma {
-						g.maxLuma = p
-					}
-					if p < g.minLuma {
-						g.minLuma = p
-					}
-					sum += uint32(p)
-					g.array[x][y] = p
-				}
-			}
-			g.avgLuma = uint8(sum / (uint32(w) * uint32(h)))
-			array[i] = g
-		} else {
+
+	var size uint64
+
+	/*Determine the number of grids in the file*/
+	size = 0
+	for i := 5; i != 0; i-- {
+		size = (size << 8) | uint64(naphilArray[i])
+	}
+
+	array := make([]Grid, int(size))
+
+	nCursor := 6
+
+	var w, h uint8
+	var w_signed, h_signed, area int
+	var dimCornAvg, sum, area_64 uint64
+	for i := range size {
+
+		/*Set the dimensions of the grid*/
+		w = naphilArray[nCursor]
+		nCursor++
+		h = naphilArray[nCursor]
+		nCursor++
+		w_signed = int(w)
+		h_signed = int(h)
+		area = w_signed * h_signed
+		area_64 = uint64(area)
+		if w == 0 || h == 0 {
 			panic("Empty grid found while reading from file")
 		}
+
+		/*Find the minimum, maximum, and sum of the pixel values of the grid*/
+		minMaxSum_result := minMaxSum(naphilArray, nCursor, nCursor+area, 255, 0)
+		sum = minMaxSum_result & 0xFFFFFF
+		minMaxSum_result >>= 24
+		minLuma = uint8(minMaxSum_result & 0xFF)
+		minMaxSum_result >>= 8
+		maxLuma = uint8(minMaxSum_result & 0xFF)
+
+		/*Set the metadata for the grid*/
+		dimCornAvg = uint64(w)
+		dimCornAvg <<= 8
+		dimCornAvg += uint64(h)
+		dimCornAvg <<= 8
+		dimCornAvg += (sum / area_64)
+		dimCornAvg <<= 8
+		dimCornAvg += uint64(naphilArray[nCursor])
+		dimCornAvg <<= 8
+		dimCornAvg += uint64(naphilArray[nCursor+w_signed-1])
+		dimCornAvg <<= 8
+		dimCornAvg += uint64(naphilArray[nCursor+area-w_signed])
+		dimCornAvg <<= 8
+		dimCornAvg += uint64(naphilArray[nCursor+area-1])
+		array[i] = Grid{
+			w__:        w,
+			h__:        h,
+			avgLuma:    uint8(sum / area_64),
+			maxLuma:    maxLuma,
+			minLuma:    minLuma,
+			offset:     nCursor,
+			dimCornAvg: dimCornAvg,
+		}
+		nCursor += area
+
 	}
-	sort.Slice(array, func(i, j int) bool { return lessGrid(array[i], array[j], false) })
-	return array, nil
+	return array, naphilArray, nil
 }
 
 /*Write the grid array to a file.*/
-func writeToFile(array []Grid, arrayLen uint32, fName string) error {
+func writeToFile(array []Grid, arrayLen int, fName string, naphilArray []uint8) error {
 	/*Predefining array size to reduce garbage collection time*/
-	byte_array := make([]byte, 6+(arrayLen*uint32(2+(int(array[arrayLen-1].w)*int(array[arrayLen-1].h)))))
+	byte_array_len := len(naphilArray) + (2 * arrayLen) + 6
+	byte_array := make([]byte, byte_array_len)
+	naphil_len := len(naphilArray)
 	/*Write the size of the array as a little-endian byte array.*/
-	for i := 0; 6 > i; i++ {
+	for i := range 6 {
 		c := uint8((arrayLen >> (8 * i)) % 256)
 		byte_array[i] = byte(c)
 	}
-	cursor := uint32(6)
+	cursor := 6
 	/*Write the dimensions of each grid, followed by its pixels*/
-	for i := uint32(0); i < arrayLen; i++ {
-		if array[i].w == 0 || array[i].h == 0 {
+	for i := 0; i < arrayLen && cursor < byte_array_len; i++ {
+		if array[i].getW() == 0 || array[i].getH() == 0 {
 			panic("Empty grid found while writing to file")
 		}
-		byte_array[cursor] = byte(array[i].w)
-		byte_array[cursor+1] = byte(array[i].h)
-		h32 := uint32(array[i].h)
-		w32 := uint32(array[i].w)
-		for j := uint32(0); j < w32; j++ {
-			for k := uint32(0); k < h32; k++ {
-				byte_array[cursor+2+(j*h32)+k] = byte(array[i].array[j][k])
-			}
+		a_offset := array[i].offset
+		w_ := array[i].getW()
+		h_ := array[i].getH()
+		byte_array[cursor] = w_
+		cursor++
+		byte_array[cursor] = byte(array[i].getH())
+		cursor++
+		h_signed := int(h_)
+		w_signed := int(w_)
+		area := h_signed * w_signed
+		if cursor >= byte_array_len || cursor+area > byte_array_len {
+			panic("Out of bounds: byte_array")
 		}
-		cursor += (2 + (w32 * h32))
+		if a_offset >= naphil_len || a_offset+area > naphil_len {
+			panic("Out of bonuds: naphilArray")
+		}
+		copy(byte_array[cursor:cursor+area], naphilArray[a_offset:a_offset+area])
+		cursor = min(cursor+area, byte_array_len)
 	}
 	return os.WriteFile(fName, byte_array[:cursor], 0777)
 }
 
-/*Combine two arrays.*/
-func combineArrays(array1 []Grid, array2 []Grid, margin float64, tNum uint32) []Grid {
-	array1 = append(array1, array2...)
-	sort.Slice(array1, func(i, j int) bool { return lessGrid(array1[i], array1[j], false) })
-	start = time.Now().UnixNano()
-	array1 = removeRedundantGrids(array1, margin, tNum)
-	return array1
+/*Sort a grid array by its metadata, in parallel*/
+func parallelSort(array []Grid, tNum int) {
+	if tNum > 1 && len(array) > 65535 {
+		n := len(array)
+		var wg sync.WaitGroup
+		size := n / tNum
+		for i := range int(tNum) {
+			start, end := i*size, (i+1)*size
+			if i == tNum-1 {
+				end = n
+			}
+			wg.Add(1)
+			go func(start, end int) {
+				defer wg.Done()
+				sort.Slice(array[start:end], func(i, j int) bool {
+					return array[start+i].dimCornAvg < array[start+j].dimCornAvg
+				})
+			}(start, end)
+		}
+		wg.Wait()
+	}
+
+	sort.Slice(array, func(i, j int) bool {
+		return array[i].dimCornAvg < array[j].dimCornAvg
+	})
+}
+
+/*Combine two arrays*/
+func combineArrays(array1 []Grid, array2 []Grid, margin float64, tNum int, naphilArray1 []uint8, naphilArray2 []uint8) ([]Grid, []uint8, int) {
+	arrayLen_1 := len(array1)
+	arrayLen_2 := len(array2)
+	arrayMergedLen := arrayLen_1 + arrayLen_2
+	arrayMerged := make([]Grid, arrayMergedLen)
+	i_ := 0
+	/*The total size of the naphilArray containing the pixel data of both arrays*/
+	naphilMergedSize := 0
+	bound_1 := arrayLen_1
+	/*The size is calculate differently if either array is sorted by range.
+	Both methods use binary searches to determine the total size.*/
+	if array1[arrayLen_1-1].dimCornAvg>>56 != 0 {
+		a_ := 0
+		b_ := len(array1)
+		for a_ < b_ {
+			m := a_ + ((b_ - a_) / 2)
+			if array1[m].dimCornAvg>>56 == 0 {
+				a_ = m + 1
+			} else {
+				b_ = m
+			}
+		}
+		i_ = a_
+		bound_1 = a_
+		for i_ < arrayLen_1 {
+			w_ := array1[i_].getW()
+			h_ := array1[i_].getH()
+			a := i_
+			b := arrayLen_1
+			for a < b {
+				m := a + ((b - a) / 2)
+				if array1[m].getW() == w_ && array1[m].getH() == h_ {
+					a = m + 1
+				} else {
+					b = m
+				}
+			}
+			naphilMergedSize += ((a - i_) * int(w_) * int(h_))
+			i_ = a
+		}
+		i_ = 0
+	}
+	for i_ < bound_1 {
+		w_ := array1[i_].getW()
+		h_ := array1[i_].getH()
+		a := i_
+		b := bound_1
+		for a < b {
+			m := a + ((b - a) / 2)
+			if array1[m].getW() == w_ && array1[m].getH() == h_ {
+				a = m + 1
+			} else {
+				b = m
+			}
+		}
+		naphilMergedSize += ((a - i_) * int(w_) * int(h_))
+		i_ = a
+	}
+	bound_2 := arrayLen_2
+	if array2[arrayLen_2-1].dimCornAvg>>56 != 0 {
+		a_ := 0
+		b_ := len(array2)
+		for a_ < b_ {
+			m := a_ + ((b_ - a_) / 2)
+			if array2[m].dimCornAvg>>56 == 0 {
+				a_ = m + 1
+			} else {
+				b_ = m
+			}
+		}
+		i_ = a_
+		bound_2 = a_
+		for i_ < arrayLen_2 {
+			w_ := array2[i_].getW()
+			h_ := array2[i_].getH()
+			a := i_
+			b := arrayLen_2
+			for a < b {
+				m := a + ((b - a) / 2)
+				if array2[m].getW() == w_ && array2[m].getH() == h_ {
+					a = m + 1
+				} else {
+					b = m
+				}
+			}
+			naphilMergedSize += ((a - i_) * int(w_) * int(h_))
+			i_ = a
+		}
+	}
+	i_ = 0
+	for i_ < bound_2 {
+		w_ := array2[i_].getW()
+		h_ := array2[i_].getH()
+		a := i_
+		b := bound_2
+		for a < b {
+			m := a + ((b - a) / 2)
+			if array2[m].getW() == w_ && array2[m].getH() == h_ {
+				a = m + 1
+			} else {
+				b = m
+			}
+		}
+		naphilMergedSize += ((a - i_) * int(w_) * int(h_))
+		i_ = a
+	}
+	naphilMerged := make([]uint8, naphilMergedSize)
+	i_ = 0
+	j_ := 0
+	k_ := 0
+	offset_ := 0
+	g_1 := array1[i_]
+	g_2 := array2[j_]
+	var area int
+	/*Determining which grid goes in which spot is reminiscent of the end of a
+	merge sort. It looks for the lowest of these, then places it into the combined
+	array, until it has exhausted one of the arrays.*/
+doubleLoopStart:
+	if g_1.dimCornAvg < g_2.dimCornAvg {
+		arrayMerged[k_] = g_1
+		arrayMerged[k_].offset = offset_
+		area = (int(g_1.getW()) * int(g_1.getH()))
+		copy(naphilMerged[offset_:offset_+area], naphilArray1[g_1.offset:g_1.offset+area])
+		offset_ += area
+		i_++
+		k_++
+		if i_ < arrayLen_1 {
+			g_1 = array1[i_]
+			goto doubleLoopStart
+		}
+		goto doubleLoopEnd
+	}
+	arrayMerged[k_] = g_2
+	arrayMerged[k_].offset = offset_
+	area = (int(g_2.getW()) * int(g_2.getH()))
+	copy(naphilMerged[offset_:offset_+area], naphilArray2[g_2.offset:g_2.offset+area])
+	offset_ += area
+	j_++
+	k_++
+	if j_ < arrayLen_2 {
+		g_2 = array2[j_]
+		goto doubleLoopStart
+	}
+	/*If any in array 1 remain*/
+	for i_ < arrayLen_1 {
+		g_1 = array1[i_]
+		arrayMerged[k_] = g_1
+		arrayMerged[k_].offset = offset_
+		area := (int(g_1.getW()) * int(g_1.getH()))
+		copy(naphilMerged[offset_:offset_+area], naphilArray1[g_1.offset:g_1.offset+area])
+		offset_ += area
+		i_++
+		k_++
+	}
+	/*If any in array 2 remain*/
+doubleLoopEnd:
+	for j_ < arrayLen_2 {
+		g_2 = array2[j_]
+		arrayMerged[k_] = g_2
+		arrayMerged[k_].offset = offset_
+		area := (int(g_2.getW()) * int(g_2.getH()))
+		copy(naphilMerged[offset_:offset_+area], naphilArray2[g_2.offset:g_2.offset+area])
+		offset_ += area
+		j_++
+		k_++
+	}
+	arrayMerged = removeRedundantGrids(arrayMerged, margin, tNum, naphilMerged)
+	return arrayMerged, naphilMerged, len(arrayMerged)
 }
 
 /*Generate an image object from an image file.*/
@@ -1743,47 +2334,19 @@ func openImage(path string) (image.Image, error) {
 	defer f.Close()
 	/*Handle PNG files specially, for reasons I cannot ascertain.*/
 	if strings.HasSuffix(strings.ToLower(path), ".png") {
-		pngImg, err := png.Decode(f)
+		pngImg, err := fastpng.Decode(f)
 		if err != nil {
 			log.Fatal(err)
 			return nil, err
 		}
 		return pngImg, err
 	}
-	/*if strings.HasSuffix(strings.ToLower(path), ".jpg") || strings.HasSuffix(strings.ToLower(path), ".jpeg") {
-		pngImg, err := png.Decode(f)
-		if err != nil {
-			log.Fatal(err)
-			return nil, err
-		}
-		return pngImg, err
-	}*/
 	img, _, err := image.Decode(f)
 	if err != nil {
 		fmt.Println("Decoding error: ", err.Error())
 		return nil, err
 	}
 	return img, nil
-}
-
-/*Convert an image to monocrhome and store it in an integer array*/
-func convertToGrayscale(img image.Image, w int, h int) [][]uint8 {
-	mono := make([][]uint8, w)
-	for x := 0; x < w; x++ {
-		mono[x] = make([]uint8, h)
-	}
-	var grayImg *image.Gray
-	var ok bool
-	if grayImg, ok = img.(*image.Gray); !ok {
-		grayImg = image.NewGray(img.Bounds())
-		draw.Draw(grayImg, grayImg.Bounds(), img, img.Bounds().Min, draw.Src)
-	}
-	for x := 0; x < w; x++ {
-		for y := 0; y < h; y++ {
-			mono[x][y] = grayImg.GrayAt(x, y).Y
-		}
-	}
-	return mono
 }
 
 /*Print a time span in human-readable format.*/
@@ -1810,73 +2373,250 @@ func printTime(t int64) {
 	}
 }
 
+/*Populate a naphil array*/
+func populateNaphil(naphilArray []uint8, pix_data []uint8, x1 uint64, x2 uint64, y1 uint64, y2 uint64, offset int, imgW uint64) {
+	w64 := x2 - x1
+	w_signed := int(w64)
+	y_16 := y1
+	y_64 := uint64(0)
+	y_signed := 0
+	y_offset := y1
+	for y_16 < y2 {
+		offset_n := offset + (y_signed * w_signed)
+		offset_p := y_offset * imgW
+		end := offset_p + x2
+		offset_p += x1
+		copy(naphilArray[offset_n:offset_n+w_signed], pix_data[offset_p:end])
+		y_16++
+		y_64++
+		y_offset++
+		y_signed++
+	}
+}
+
+/*Determines the sum of a subset of a naphil, and nothing else*/
+func sumNaphil(naphilArray []uint8, a int, b int) uint64 {
+	i := a
+	sum := uint64(0)
+	for i < b {
+		sum += uint64(naphilArray[i])
+		i++
+		if i >= b {
+			break
+		}
+		sum += uint64(naphilArray[i])
+		i++
+		if i >= b {
+			break
+		}
+		sum += uint64(naphilArray[i])
+		i++
+		if i >= b {
+			break
+		}
+		sum += uint64(naphilArray[i])
+		i++
+	}
+	return sum
+}
+
 /*
-Creates an image whose brightness is based on the result of a luma trace and
-whose color is based on the original image
+Determines the highest and lowest values in a subset of a naphil, but
+stops checking for highest if it finds 255 and lowest if 0. It calculates
+the sum all the while.
 */
-func colorize(img image.Image, array1 [][]uint8, array2 [][]uint8, w int, h int) image.Image {
-	imgType := strings.ToLower(reflect.TypeOf(img).String())
-	/*This section is for grayscale output.*/
-	tp := uint8(16)
-	if strings.HasSuffix(imgType, "gray") {
-		ymg := image.NewGray(image.Rectangle{image.Point{0, 0}, image.Point{w, h}})
-		for x := 0; x < w; x++ {
-			for y := 0; y < h; y++ {
-				ln := array2[x][y]
-				gray := array1[x][y]
-				for byteAbsDiff(ln, gray) > tp {
-					ln = (ln >> 1) + (gray >> 1) + (1 & ln & gray)
-				}
-				ymg.SetGray(x, y, color.Gray{ln})
+func minMaxSum(naphilArray []uint8, a int, b int, minLuma uint8, maxLuma uint8) uint64 {
+	i := a
+	sum := uint64(0)
+	var p uint8
+	if minLuma != 0 && maxLuma != 255 {
+		for i < b {
+			p = naphilArray[i]
+			sum += uint64(p)
+			if p > maxLuma {
+				maxLuma = p
+			}
+			if p < minLuma {
+				minLuma = p
+			}
+			i++
+			if i >= b {
+				break
+			}
+			p = naphilArray[i]
+			sum += uint64(p)
+			if p > maxLuma {
+				maxLuma = p
+			}
+			if p < minLuma {
+				minLuma = p
+			}
+			i++
+			if i >= b {
+				break
+			}
+			p = naphilArray[i]
+			sum += uint64(p)
+			if p > maxLuma {
+				maxLuma = p
+			}
+			if p < minLuma {
+				minLuma = p
+			}
+			i++
+			if i >= b {
+				break
+			}
+			p = naphilArray[i]
+			sum += uint64(p)
+			if p > maxLuma {
+				maxLuma = p
+			}
+			if p < minLuma {
+				minLuma = p
+			}
+			i++
+			if maxLuma == 255 || minLuma == 0 {
+				break
 			}
 		}
-		return ymg
 	}
-	/*Currently, only monochrome and RGBA images are supported.*/
-	if strings.HasSuffix(imgType, "rgba") || strings.HasSuffix(imgType, "paletted") {
-		ymg := image.NewRGBA(image.Rectangle{image.Point{0, 0}, image.Point{w, h}})
-		for x := 0; x < w; x++ {
-			for y := 0; y < h; y++ {
-				r, g, b, _ := img.At(x, y).RGBA()
-				r >>= 8
-				g >>= 8
-				b >>= 8
-				/*The loop multiplies the original RGB values by the ratio of the luma trace to the
-				original brightness value, unless the pixel is black or close enough to gray.*/
-				/*Regardless, loops are used to bring errant shades closer to the base image, to
-				prevent blotching.*/
-				ln := array2[x][y]
-				if (r > 0 || g > 0 || b > 0) && 100*minUint32(r, minUint32(g, b)) < 95*maxUint32(r, maxUint32(g, b)) {
-					ratio := float64(ln) / float64(array1[x][y])
-					r_ := uint8(ratio * float64(r))
-					for byteAbsDiff(r_, uint8(r)) > tp {
-						r_ = (r_ >> 1) + (uint8(r) >> 1) + (1 & r_ & uint8(r))
-					}
-					g_ := uint8(ratio * float64(g))
-					for byteAbsDiff(g_, uint8(g)) > tp {
-						g_ = (g_ >> 1) + (uint8(g) >> 1) + (1 & g_ & uint8(g))
-					}
-					b_ := uint8(ratio * float64(b))
-					for byteAbsDiff(b_, uint8(b)) > tp {
-						b_ = (b_ >> 1) + (uint8(b) >> 1) + (1 & b_ & uint8(b))
-					}
-					ymg.SetRGBA(x, y, color.RGBA{r_, g_, b_, 255})
-				} else {
-					gray := array1[x][y]
-					for byteAbsDiff(ln, gray) > tp {
-						ln = (ln >> 1) + (gray >> 1) + (1 & ln & gray)
-					}
-					ymg.SetRGBA(x, y, color.RGBA{ln, ln, ln, 255})
+	if i < b {
+		if maxLuma == 255 {
+			for i < b {
+				p = naphilArray[i]
+				sum += uint64(p)
+				if p < minLuma {
+					minLuma = p
+				}
+				i++
+				if i >= b {
+					break
+				}
+				p = naphilArray[i]
+				sum += uint64(p)
+				if p < minLuma {
+					minLuma = p
+				}
+				i++
+				if i >= b {
+					break
+				}
+				p = naphilArray[i]
+				sum += uint64(p)
+				if p < minLuma {
+					minLuma = p
+				}
+				i++
+				if i >= b {
+					break
+				}
+				p = naphilArray[i]
+				sum += uint64(p)
+				if p < minLuma {
+					minLuma = p
+				}
+				i++
+				if minLuma == 0 {
+					break
+				}
+			}
+		} else if minLuma == 0 {
+			for i < b {
+				p = naphilArray[i]
+				sum += uint64(p)
+				if p > maxLuma {
+					maxLuma = p
+				}
+				i++
+				if i >= b {
+					break
+				}
+				p = naphilArray[i]
+				sum += uint64(p)
+				if p > maxLuma {
+					maxLuma = p
+				}
+				i++
+				if i >= b {
+					break
+				}
+				p = naphilArray[i]
+				sum += uint64(p)
+				if p > maxLuma {
+					maxLuma = p
+				}
+				i++
+				if i >= b {
+					break
+				}
+				p = naphilArray[i]
+				sum += uint64(p)
+				if p > maxLuma {
+					maxLuma = p
+				}
+				i++
+				if maxLuma == 255 {
+					break
 				}
 			}
 		}
-		return ymg
 	}
-	return nil
+	if i < b {
+		return (0xFF00 << 24) + sumNaphil(naphilArray, i, b)
+	}
+	return sum + (uint64(minLuma) << 24) + (uint64(maxLuma) << 32)
+}
+
+/*A recursive function involved in combining arrays*/
+func combineArraysRec(fileNames []string, a int, b int, margin float64, tNum int) ([]Grid, []uint8, int) {
+	if a < b {
+		array1, naphil1, size1 := combineArraysRec(fileNames, a, a+((b-a)/2), margin, tNum)
+		array2, naphil2, size2 := combineArraysRec(fileNames, a+((b-a)/2)+1, b, margin, tNum)
+		if array1 == nil || size1 == 0 {
+			return array2, naphil2, size2
+		}
+		if array2 == nil || size2 == 0 {
+			return array1, naphil1, size1
+		}
+		return combineArrays(array1, array2, margin, tNum, naphil1, naphil2)
+	}
+	var array []Grid
+	var naphil []uint8
+	var err error
+	var i_, arrayLen int
+	var margInt uint8
+	array, naphil, err = readFromFile(fileNames[a])
+	if err != nil {
+		panic("Invalid file")
+	}
+	i_ = 0
+	arrayLen = len(array)
+	margInt = uint8(256.0 * margin)
+	/*Marks grids with a substantial difference between maximum
+	and minimum value, then sorts.*/
+	for i_ < arrayLen {
+		if array[i_].maxLuma-array[i_].minLuma > margInt {
+			array[i_].dimCornAvg |= 0x0F00000000000000
+		}
+		i_++
+	}
+	parallelSort(array, tNum)
+	return array, naphil, len(array)
 }
 
 func main() {
 	rand.Seed(time.Now().UnixNano())
+
+	proFile, err := os.Create("Luma.prof")
+
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	pprof.StartCPUProfile(proFile)
+	defer pprof.StopCPUProfile()
 
 	/*The following options are as such:
 	-i	Used to specify an input image or set of input images with a
@@ -1897,7 +2637,15 @@ func main() {
 	oArray := make([]string, 0)
 	tArray := make([]string, 0)
 	array := make([]Grid, 0)
-	var arrayLen uint32
+	arrayFromImg := make([]Grid, 0)
+	arrayFromFile := make([]Grid, 0)
+	var arrayLen int
+	var arrayImgLen int
+	var arrayFileLen int
+	var naphilArray []uint8
+	var imageDataNaphil []uint8
+	var fileDataNaphil []uint8
+	//var traceNaphil []uint8
 	args := os.Args
 	/*The following for loop creates arrays correspdonding to each of the
 	above arguments.*/
@@ -2002,6 +2750,10 @@ func main() {
 		fmt.Println("Please specify input image(s), minimum and maximum grid dimensions, and margin, in that exact order.")
 		return
 	}
+	if len(iArray)-3 > 0x3FFFFF {
+		fmt.Println("Too many images.")
+		return
+	}
 	if len(yArray) > 0 && len(yArray) < 3 {
 		fmt.Println("Please specify at least one base image file, minimum and maximum grid dimensions, in that exact order.")
 		return
@@ -2011,10 +2763,10 @@ func main() {
 		return
 	}
 	/*This handles inputting one or more file containing a grid array.*/
-	tNum := uint64(1)
-	var errT error
+	tNum := 1
 	if len(tArray) == 1 {
-		tNum, errT = strconv.ParseUint(tArray[0], 10, 8)
+		t64, errT := strconv.ParseUint(tArray[0], 10, 8)
+		tNum := t64
 		if errT != nil {
 			fmt.Println("Please specify an integer for thread number")
 			log.Fatal(err)
@@ -2027,153 +2779,532 @@ func main() {
 		fmt.Printf("Thread num: %d\n", tNum)
 	}
 
-	if len(lArray) > 0 {
-		fmt.Println("Adding data from " + lArray[0])
-		arrayTemp, err := readFromFile(lArray[0])
-		if nil != err {
-			fmt.Println("Please specify valid filenames for all input datasets.")
-			log.Fatal(err)
-			return
-		}
-		array = arrayTemp
-		arrayLen = uint32(len(array))
-		for i := uint32(0); i < arrayLen; i++ {
-			for array[i].w < 1 || array[i].h < 1 {
-				array = append(array[:i], array[i+1:]...)
-				arrayLen--
-			}
-		}
-		fmt.Printf("%v\n", len(array))
-		/*If there are multiple arguments for -l, a margin must go at the end, following
-		VALID filenames.*/
-		if len(lArray) > 2 {
-			margin, err := strconv.ParseFloat(lArray[len(lArray)-1], 64)
-			if nil != err {
-				fmt.Println("Please specify margin AFTER all input datasets.")
-				log.Fatal(err)
+	if len(iArray) > 0 || len(lArray) > 0 {
+		var errMarg error
+		margin := float64(-1)
+		/*Take grid data from images*/
+		if len(iArray) > 0 {
+			minIn, errMin := strconv.ParseUint(iArray[len(iArray)-3], 10, 8)
+			maxIn, errMax := strconv.ParseUint(iArray[len(iArray)-2], 10, 8)
+			minIn_64 := uint64(minIn)
+			if maxIn < minIn*2 {
+				fmt.Println("Please specify a maximum size at least twice that of the minimum size.")
 				return
 			}
-			for i := 1; i < len(lArray)-1; i++ {
-				fmt.Println("Adding data from " + lArray[i])
-				arrayTemp, err := readFromFile(lArray[i])
+			if maxIn > 255 || minIn > 255 {
+				fmt.Println("Please specify maximum and minimum sizes BELOW 256")
+			}
+			margin, errMarg = strconv.ParseFloat(iArray[len(iArray)-1], 64)
+			if nil != errMin || nil != errMax || nil != errMarg {
+				fmt.Println("Please specify minimum and maximum grid dimensions and margin, in that order, AFTER all input images.")
+				if nil != errMin {
+					log.Fatal(errMin)
+				} else if nil != errMax {
+					log.Fatal(errMax)
+				} else if nil != errMarg {
+					log.Fatal(errMarg)
+				}
+				return
+			}
+			startTemp := time.Now().UnixNano()
+			trees := make([]*Tree, len(iArray)-3)
+
+			totalLeafNum := 0
+			fmt.Printf("Generating trees:\n")
+			startTime := time.Now().UnixNano()
+			tempTime := time.Now().UnixNano()
+			var wg sync.WaitGroup
+			widthArray := make([]uint16, len(trees))
+			heightArray := make([]uint16, len(trees))
+			totalArea := 0
+			/*Go image by image*/
+			for jj := 0; jj < len(trees); jj += tNum {
+				if time.Now().UnixNano()-tempTime > 1000000000 {
+					fmt.Printf("%f\n", 100.0*float32(jj)/float32(len(trees)))
+					tempTime = time.Now().UnixNano()
+				}
+				for kk := range tNum {
+					wg.Add(1)
+					go func(kk int) {
+						defer wg.Done()
+						i := jj + kk
+						if i < len(trees) {
+							f, err := os.Open(iArray[i])
+							if err != nil {
+								panic(err)
+							}
+							defer f.Close()
+							config, _, err := image.DecodeConfig(f)
+							if err != nil {
+								panic(err)
+							}
+							w := config.Width
+							h := config.Height
+							if w > 8191 || h > 8191 {
+								fmt.Println("Please choose images with dimensions below 8192.")
+								return
+							}
+							widthArray[i] = uint16(w)
+							heightArray[i] = uint16(h)
+							totalArea += (w * h)
+							/*Generate tree*/
+							trees[i] = generateTree(0, uint64(w), 0, uint64(h), minIn_64, uint64(maxIn), rand.Uint64(), rand.Uint64())
+							totalLeafNum += trees[i].leafNum
+						}
+					}(kk)
+				}
+				wg.Wait()
+			}
+			end := time.Now().UnixNano()
+			timeTotal := (end - startTime)
+			printTime(timeTotal)
+
+			coordArray := make([][]uint64, totalLeafNum)
+			indexArray := make([]int, totalLeafNum)
+			encodedCoordArray := make([]uint64, totalLeafNum)
+			tempLeafNum := 0
+
+			fmt.Printf("Gathering coordinates from trees:\n")
+			tempIndex := 0
+			startTime = time.Now().UnixNano()
+			tempTime = time.Now().UnixNano()
+			/*The changeArray finds where the metadata array changes in terms of the dimensions
+			or source image referred to. Its size will always be
+			(((max-min+1)^2)*img_num)+1
+			where img_num is the number of images.*/
+			img_step := int(maxIn - minIn + 1)
+			img_step *= img_step
+			changeArraySize := img_step * len(trees)
+			changeArraySize++
+			changeArray := make([]int, changeArraySize)
+			changeArray[changeArraySize-1] = totalLeafNum
+			changeArraySize = 1
+			/*Get the total number of leaves which will be the same as the total number of grids.*/
+			for i := range trees {
+				if time.Now().UnixNano()-tempTime > 1000000000 {
+					fmt.Printf("%f\n", 100.0*float32(i)/float32(len(trees)))
+					tempTime = time.Now().UnixNano()
+				}
+				reuse := make([]uint64, 5)
+				coordsFromTree(trees[i], uint64(i), coordArray, tempLeafNum, reuse)
+				/*Encode grid metadata into uint64 array*/
+				encodeCoords(trees[i], uint64(i), encodedCoordArray, tempLeafNum)
+				l := trees[i].leafNum
+				tEnd := tempLeafNum + l
+				/*Sort these grids based on width and height*/
+				sort.Slice(encodedCoordArray[tempLeafNum:tEnd], func(i, j int) bool {
+					return encodedCoordArray[tempLeafNum+i] < encodedCoordArray[tempLeafNum+j]
+				})
+				wh := uint64(0)
+				w_ := 0
+				h_ := 0
+				/*Calculate the offsets for each grid in the naphil array*/
+				for j := tempLeafNum; j < tEnd; j++ {
+					indexArray[j] = tempIndex
+					enc := encodedCoordArray[j]
+					/*If a grid which will not have the same dimensions as
+					the one previous is found, re-extract dimensions.*/
+					if (enc>>26)&0xFFFF != wh {
+						enc >>= 26
+						wh = enc & 0xFFFF
+						h_ = int(enc & 255)
+						enc >>= 8
+						w_ = int(enc & 255)
+					}
+					tempIndex += (w_ * h_)
+				}
+				tempLeafNum = tEnd
+			}
+			x1_ := 0
+			changeArray[0] = 0
+			var m int
+			ignoreCoords := (^uint64(0x3FFFFFF))
+			enc := encodedCoordArray[0]
+			encOld := uint64(0xFFFFFFFFFFFFFFFF)
+			imageEnd := trees[0].leafNum
+			x2_ := imageEnd
+			for x1_ < x2_ {
+				m = x1_ + ((x2_ - x1_) / 2)
+				if encodedCoordArray[m]&ignoreCoords != enc&ignoreCoords {
+					x2_ = m
+				} else {
+					x1_ = m + 1
+				}
+			}
+			for x1_ < totalLeafNum {
+				/*Put the result of the bin search into changeArray*/
+				changeArray[changeArraySize] = x1_
+				/*Increment counter*/
+				changeArraySize++
+				/*Check if the next section of the grids metadata referss to a different
+				source image*/
+				encOld = enc >> 42
+				if x1_ >= totalLeafNum {
+					panic("Out of bounds")
+				}
+				enc = encodedCoordArray[x1_]
+				if enc>>42 != encOld {
+					imageEnd += trees[enc>>42].leafNum
+				}
+				/*Set the end of the next bin search to the last grid to be taken from the
+				same source image*/
+				x2_ = imageEnd
+				/*Peform a binary search for the last grid with equal dimensions
+				and from the same source image as the one at x1_*/
+				for x1_ < x2_ {
+					m = x1_ + ((x2_ - x1_) / 2)
+					if encodedCoordArray[m]&ignoreCoords != enc&ignoreCoords {
+						x2_ = m
+					} else {
+						x1_ = m + 1
+					}
+				}
+			}
+			/*Named after a race of mysterious beings mentioned in Genesis 6, later described of being
+			great stature in Numbers 32 and usually translated as "giants" in other languages. This will
+			indeed be a giant array.*/
+			imageDataNaphil = make([]uint8, indexArray[totalLeafNum-1]+(int(maxIn)*int(maxIn)))
+			end = time.Now().UnixNano()
+			timeTotal = (end - startTemp)
+			printTime(timeTotal)
+
+			arrayFromImg = make([]Grid, totalLeafNum)
+			tempLeafNum = 0
+			fmt.Printf("Generating grids:\n")
+			startTime = time.Now().UnixNano()
+			tempTime = time.Now().UnixNano()
+
+			margInt := uint8(margin * 256.0)
+
+			for jj := 0; jj < len(trees); jj += int(tNum) {
+				tln := 0
+				for j := range jj {
+					tln += trees[j].leafNum
+				}
+				if time.Now().UnixNano()-tempTime > 1000000000 {
+					fmt.Printf("%f\n", 100.0*float32(jj)/float32(len(iArray)-3))
+					tempTime = time.Now().UnixNano()
+				}
+				for kk := range int(tNum) {
+					wg.Add(1)
+					go func(kk int) {
+						defer wg.Done()
+						i := jj + kk
+						i_64 := uint64(i)
+						/*If cursor points to a valid image*/
+						if i < len(trees) {
+							/*Retrive the width of the image, store it as a signed value*/
+							imgW_64 := uint64(widthArray[i])
+							imgH_64 := uint64(heightArray[i])
+							imgW_signed := int(imgW_64)
+							/*Get a grayscale representation of the same image*/
+							pix_data := func(iArray []string, i int) []uint8 {
+								grayImg := gocv.IMRead(iArray[i], gocv.IMReadGrayScale)
+
+								if grayImg.Empty() {
+									panic("Error loading image")
+								}
+								defer grayImg.Close()
+
+								return grayImg.ToBytes()
+							}(iArray, i)
+							/*Find the part of the change array which refer to this image, set a loop to
+							these endpoints*/
+							cng_start := i * img_step
+							cng_end := cng_start + img_step
+							for c_outer := cng_start; c_outer < cng_end; c_outer++ {
+								/*Get the encoded metadata for the first grid in the segment, and ignore
+								all bits besides those containing grid dimensions. Extract these dimensions
+								and save the 16 bits containing all of them for when the dimCornAvg of
+								individual grids is set.*/
+								enc_start := (encodedCoordArray[changeArray[c_outer]] >> 26) & 0xFFFF
+								h_64 := enc_start & 255
+								h_signed := int(h_64)
+								h_8 := uint8(h_64)
+								w_64 := (enc_start >> 8) & 255
+								w_signed := int(w_64)
+								w_8 := uint8(w_64)
+								/*Get the end of the loop for the current segment*/
+								loop_end := changeArray[c_outer+1]
+								area := w_64 * h_64
+								area_signed := h_signed * w_signed
+								var enc, x1, y1, y2, sum, avg, dimCornAvg, crnr_64, corners uint64
+								var x1_signed, offset, offset_n, end_n, start_p, end_p /*, j, end*/ int
+								var y_offset, y2_signed int
+								var maxLuma, minLuma, crnr uint8
+								for c_sub := changeArray[c_outer]; c_sub < loop_end; c_sub++ {
+									/*Get the metadata for an individual grid*/
+									enc = encodedCoordArray[c_sub]
+									if (enc >> 42) != i_64 {
+										panic("Wrong image")
+									}
+									if (enc>>26)&0xFFFF != enc_start {
+										panic("Wrong dimensions")
+									}
+									/*Extract the coordinates from the metadata*/
+									y1 = (^enc) & 8191
+									enc >>= 13
+									x1 = (^enc) & 8191
+									y2 = y1 + h_64
+									if y1 > imgH_64 || y2 > imgH_64 || x1 > imgW_64 || x1+w_64 > imgW_64 {
+										panic("Wrong coordinates")
+									}
+									y2_signed = int(y2)
+									x1_signed = int(x1)
+									offset = indexArray[c_sub]
+									/*The variables offset_n and end_n are endpoints of the naphil array. They increment by the grid's
+									width.*/
+									end_n = offset + w_signed
+									offset_n = offset
+									offset_end := offset + area_signed
+									y_offset = int(y1)
+									/*The variables start_p and end_p are endpoints of the array containing image data. They increment
+									by the image's width.*/
+									start_p = (int(y1) * imgW_signed) + x1_signed
+									end_p = start_p + w_signed
+									/*Copy data from the image into the naphil array*/
+									for y_offset < y2_signed {
+										copy(imageDataNaphil[offset_n:end_n], pix_data[start_p:end_p])
+										offset_n += w_signed
+										end_n += w_signed
+										start_p += imgW_signed
+										end_p += imgW_signed
+										y_offset++
+										if y_offset >= y2_signed {
+											break
+										}
+										copy(imageDataNaphil[offset_n:end_n], pix_data[start_p:end_p])
+										offset_n += w_signed
+										end_n += w_signed
+										start_p += imgW_signed
+										end_p += imgW_signed
+										y_offset++
+										if y_offset >= y2_signed {
+											break
+										}
+										copy(imageDataNaphil[offset_n:end_n], pix_data[start_p:end_p])
+										offset_n += w_signed
+										end_n += w_signed
+										start_p += imgW_signed
+										end_p += imgW_signed
+										y_offset++
+										if y_offset >= y2_signed {
+											break
+										}
+										copy(imageDataNaphil[offset_n:end_n], pix_data[start_p:end_p])
+										offset_n += w_signed
+										end_n += w_signed
+										start_p += imgW_signed
+										end_p += imgW_signed
+										y_offset++
+									}
+
+									/*Add the corners to the total sum, which will be used to calculate
+									the average later*/
+								minMaxLoopStart:
+									crnr = imageDataNaphil[offset]
+									maxLuma = crnr
+									minLuma = crnr
+									crnr_64 = uint64(crnr)
+									corners = crnr_64
+									sum = crnr_64
+									corners <<= 8
+
+									crnr = imageDataNaphil[offset+w_signed-1]
+									if crnr > maxLuma {
+										maxLuma = crnr
+									} else if crnr < minLuma {
+										minLuma = crnr
+									}
+									crnr_64 = uint64(crnr)
+									corners += crnr_64
+									sum += crnr_64
+									corners <<= 8
+
+									crnr = imageDataNaphil[offset_end-w_signed]
+									if crnr > maxLuma {
+										maxLuma = crnr
+									} else if crnr < minLuma {
+										minLuma = crnr
+									}
+									crnr_64 = uint64(crnr)
+									corners += crnr_64
+									sum += crnr_64
+									corners <<= 8
+
+									crnr = imageDataNaphil[offset_end-1]
+									if crnr > maxLuma {
+										maxLuma = crnr
+									} else if crnr < minLuma {
+										minLuma = crnr
+									}
+									crnr_64 = uint64(crnr)
+									corners += crnr_64
+									sum += crnr_64
+									/*Check for the minimum and maximum values of all pixels except the corners,
+									while adding them to the sum. A sweep is done for the top and bottom rows,
+									and another for everything else.*/
+									if minLuma != 0 || maxLuma != 255 {
+										minMaxSum_result := minMaxSum(imageDataNaphil, offset+1, offset+w_signed-1, minLuma, maxLuma)
+										sum += (minMaxSum_result & 0xFFFFFF)
+										minMaxSum_result >>= 24
+										minLuma = uint8(minMaxSum_result & 0xFF)
+										minMaxSum_result >>= 8
+										maxLuma = uint8(minMaxSum_result & 0xFF)
+									} else {
+										sum += sumNaphil(imageDataNaphil, offset+1, offset+w_signed-1)
+									}
+									if minLuma != 0 || maxLuma != 255 {
+										minMaxSum_result := minMaxSum(imageDataNaphil, offset_end-w_signed+1, offset_end-1, minLuma, maxLuma)
+										sum += (minMaxSum_result & 0xFFFFFF)
+										minMaxSum_result >>= 24
+										minLuma = uint8(minMaxSum_result & 0xFF)
+										minMaxSum_result >>= 8
+										maxLuma = uint8(minMaxSum_result & 0xFF)
+									} else {
+										sum += sumNaphil(imageDataNaphil, offset_end-w_signed+1, offset_end-1)
+									}
+									if minLuma != 0 || maxLuma != 255 {
+										minMaxSum_result := minMaxSum(imageDataNaphil, offset+w_signed, offset_end-w_signed, minLuma, maxLuma)
+										sum += (minMaxSum_result & 0xFFFFFF)
+										minMaxSum_result >>= 24
+										minLuma = uint8(minMaxSum_result & 0xFF)
+										minMaxSum_result >>= 8
+										maxLuma = uint8(minMaxSum_result & 0xFF)
+									} else {
+										sum += sumNaphil(imageDataNaphil, offset+w_signed, offset_end-w_signed)
+									}
+
+									/*Calculate the average*/
+									avg = sum / area
+									if avg > 255 {
+										panic("Invalid average.")
+									}
+									if uint8(avg) < minLuma || uint8(avg) > maxLuma {
+										goto minMaxLoopStart
+									}
+
+									/*The main purpose of dimCornAvg is for sorting. The intended algorithm is to sort all
+									"shallow" grids (those with relatively low differences between min and max values) at
+									the beginning, before all "deep" grids (those with relatively high differences). Then,
+									the grids are to be sorted by width, height, average luma, and finally their corners.
+									Since the actual difference between min and max is less important than the binary
+									"deep-shallow" distinction, "deep" grids have some of the top bits set.
+									The variable enc_start from earlier contains the width of the grid as its most signifcant
+									eight bits and height as its least significant.*/
+									dimCornAvg = uint64(0)
+									if maxLuma-minLuma > margInt {
+										dimCornAvg = 15
+									}
+									dimCornAvg <<= 16
+									dimCornAvg += enc_start
+									dimCornAvg <<= 8
+									dimCornAvg += avg
+									dimCornAvg <<= 32
+									dimCornAvg += corners
+									func() {
+										arrayFromImg[c_sub] = Grid{
+											w__:        w_8,
+											h__:        h_8,
+											minLuma:    minLuma,
+											maxLuma:    maxLuma,
+											avgLuma:    uint8(avg),
+											dimCornAvg: dimCornAvg,
+											offset:     offset,
+										}
+									}()
+								}
+							}
+						}
+					}(kk)
+				}
+				wg.Wait()
+			}
+			end = time.Now().UnixNano()
+			timeTotal = (end - startTemp)
+			printTime(timeTotal)
+
+			arrayImgLen = len(arrayFromImg)
+
+			fmt.Printf("Sorting started\n")
+			parallelSort(arrayFromImg, tNum)
+			fmt.Printf("Sorting completed\n")
+
+			if margin > 0 {
+				fmt.Println("Removing redundant grids")
+				start = time.Now().UnixNano()
+				startTemp = time.Now().UnixNano()
+				arrayFromImg = removeRedundantGrids(arrayFromImg, margin, tNum, imageDataNaphil)
+				end = time.Now().UnixNano()
+				arrayImgLen = len(arrayFromImg)
+				timeTotal := (end - startTemp)
+				printTime(timeTotal)
+			}
+		}
+		/*Take grid data from files previously created by Luma*/
+		if len(lArray) > 0 {
+			if len(lArray) == 1 {
+				fmt.Println("Adding data from " + lArray[0])
+				arrayFromFile, fileDataNaphil, err = readFromFile(lArray[0])
 				if nil != err {
 					fmt.Println("Please specify valid filenames for all input datasets.")
 					log.Fatal(err)
 					return
 				}
-				arrayLen := uint32(len(arrayTemp))
-				for i := uint32(0); i < arrayLen; i++ {
-					for arrayTemp[i].w < 1 || arrayTemp[i].h < 1 {
-						arrayTemp = append(arrayTemp[:i], arrayTemp[i+1:]...)
-						arrayLen--
+				arrayFileLen = len(arrayFromFile)
+				for i := range arrayFileLen {
+					for arrayFromFile[i].getW() < 1 || arrayFromFile[i].getH() < 1 {
+						arrayFromFile = slices.Delete(arrayFromFile, i, i+1)
+						arrayFileLen--
 					}
 				}
-				array = combineArrays(array, arrayTemp, margin, uint32(tNum))
-				n1 := uint32(0)
-				n2 := uint32(len(array))
-				var m uint32
-				for n1 < n2 {
-					m = n1 + ((n2 - n1) >> 1)
-					if array[m].w == 0 || array[m].h == 0 {
-						n2 = m
-					} else {
-						n1 = m + 1
-					}
-				}
-				arrayLen = n1
-				fmt.Printf("%v\n", arrayLen)
+				fmt.Printf("%v\n", len(arrayFromFile))
 			}
+			/*If there are multiple arguments for -l, a margin must go at the end, following
+			VALID filenames.*/
+			if len(lArray) > 2 {
+				if margin < 0 {
+					margin, err = strconv.ParseFloat(lArray[len(lArray)-1], 64)
+					if nil != err {
+						fmt.Println("Please specify margin AFTER all input datasets.")
+						log.Fatal(err)
+						return
+					}
+				}
+				fmt.Println("Merging datasets...")
+				arrayFromFile, fileDataNaphil, arrayFileLen = combineArraysRec(lArray, 0, len(lArray)-2, margin, tNum)
+				fmt.Println("Datasets merged.")
+			}
+		}
+		/*Combine data derived from both images and files*/
+		if len(iArray) > 0 && len(lArray) > 0 {
+			array, naphilArray, arrayLen = combineArrays(arrayFromImg, arrayFromFile, margin, tNum, imageDataNaphil, fileDataNaphil)
+		} else if len(iArray) == 0 {
+			array = arrayFromFile
+			naphilArray = fileDataNaphil
+			arrayLen = arrayFileLen
+		} else {
+			array = arrayFromImg
+			naphilArray = imageDataNaphil
+			arrayLen = arrayImgLen
 		}
 	}
-	/*This handles inputting one or more images for the purposes of creating grid arrays.*/
-	if len(iArray) > 0 {
-		minIn, errMin := strconv.ParseUint(iArray[len(iArray)-3], 10, 8)
-		maxIn, errMax := strconv.ParseUint(iArray[len(iArray)-2], 10, 8)
-		/*There are a lot of issues that crop up when the maximum is less than twice the
-		minimum, and until I hammer those out, this constraint will remain.*/
-		if maxIn < minIn*2 {
-			fmt.Println("Please specify a maximum size at least twice that of the minimum size.")
-			return
+	/*Trace an image*/
+	if len(yArray) >= 3 {
+		i_ := 0
+		for i_ < arrayLen {
+			g := array[i_]
+			d := g.dimCornAvg
+			d &= 0x00FFFFFF00000000
+			maxL := g.maxLuma
+			minL := g.minLuma
+			d += (uint64(maxL-minL) << 24)
+			d += (uint64(minL) << 16)
+			d += (uint64(maxL) << 8)
+			array[i_].dimCornAvg = d
+			i_++
 		}
-		margin, errMarg := strconv.ParseFloat(iArray[len(iArray)-1], 64)
-		if nil != errMin || nil != errMax || nil != errMarg {
-			fmt.Println("Please specify minimum and maximum grid dimensions and margin, in that order, AFTER all input images.")
-			if nil != errMin {
-				log.Fatal(errMin)
-			} else if nil != errMax {
-				log.Fatal(errMax)
-			} else if nil != errMarg {
-				log.Fatal(errMarg)
-			}
-			return
-		}
-		startTemp := time.Now().UnixNano()
-		imgArray := make([][][]uint8, len(iArray)-3)
-		trees := make([]*Tree, len(iArray)-3)
-		monoTime := int64(0)
-		for i := 0; i < len(iArray)-3; i += int(tNum) {
-			wg.Add(int(tNum))
-			for j := 0; j < int(tNum); j++ {
-				go func(j int) {
-					defer wg.Done()
-					if i+j < len(iArray)-3 {
-						monoStart := time.Now().UnixNano()
-						img, err := openImage(iArray[i+j])
-						if nil != err {
-							fmt.Println("Please specify valid filenames for all input images.")
-							log.Fatal(err)
-							return
-						}
-						fmt.Printf("Reading %s\n", iArray[i+j])
-						imgBnd := img.Bounds()
-						w := imgBnd.Max.X
-						h := imgBnd.Max.Y
-						imgArray[i+j] = convertToGrayscale(img, w, h)
-						monoTime += (time.Now().UnixNano() - monoStart)
-						trees[i+j] = generateTree(0, uint32(w), 0, uint32(h), uint8(minIn), uint8(maxIn))
-					}
-				}(j)
-			}
-			wg.Wait()
-		}
-		fmt.Printf("Time taken to intercept and decolorize images: ")
-		printTime(monoTime)
-		fmt.Printf("Creating grids from images\n")
-		gridCrStart := time.Now().UnixNano()
-		array = gridsFromCoords(imgArray, trees)
-		gridCrEnd := time.Now().UnixNano()
-		fmt.Printf("Creation of grids complete: \n")
-		printTime(gridCrEnd - gridCrStart)
-		fmt.Printf("Sorting started\n")
-		sort.Slice(array, func(i, j int) bool { return lessGrid(array[i], array[j], false) })
-		fmt.Printf("Sorting completed\n")
-		if margin > 0 {
-			fmt.Println("Removing redundant grids")
-			start = time.Now().UnixNano()
-			array = removeRedundantGrids(array, margin, uint32(tNum))
-			n1 := uint32(0)
-			n2 := uint32(len(array))
-			var m uint32
-			for n1 < n2 {
-				m = n1 + ((n2 - n1) >> 1)
-				if array[m].w == 0 || array[m].h == 0 {
-					n2 = m
-				} else {
-					n1 = m + 1
-				}
-			}
-			arrayLen = n1
-			end := time.Now().UnixNano()
-			timeTotal := (end - startTemp)
-			printTime(timeTotal)
-		}
-	}
-	/*This handles the luma trace, which breaks an image or image sequence down into
-	parts and replaces them with the most simlar grid in a stored array.*/
-	/*
-		One input image		presence of digit string irrelevant, add extension if not present
-		Multiple input images	if digit string present and no extension in output, distribut*/
-	if 3 <= len(yArray) {
+		parallelSort(array, tNum)
 		minIn, errMin := strconv.ParseUint(yArray[len(yArray)-2], 10, 8)
 		maxIn, errMax := strconv.ParseUint(yArray[len(yArray)-1], 10, 8)
 		if nil != errMin || nil != errMax {
@@ -2186,6 +3317,10 @@ func main() {
 			}
 			return
 		}
+		if minIn > 255 || maxIn > 255 {
+			fmt.Println("Please specify minimum and maximum values BELOW 256.")
+			return
+		}
 		leadingZeroes := uint8(0)
 		outputPrefix := ""
 		outputSuffix := ""
@@ -2194,7 +3329,7 @@ func main() {
 		cifLength := len(commonImageFormats)
 		foundExt := int8(0)
 		if len(yArray) == 3 {
-			for i := 0; i < cifLength; i++ {
+			for i := range cifLength {
 				if strings.HasSuffix(strings.ToUpper(oArray[i]), fmt.Sprintf("%s%s", ".", commonImageFormats[i])) {
 					foundExt += 1
 					break
@@ -2215,7 +3350,7 @@ func main() {
 			calculates how many digits there need to be.*/
 			if nil == matches || len(matches) < 1 {
 				foundExt = 0
-				for i := 0; i < cifLength; i++ {
+				for i := range cifLength {
 					if strings.HasSuffix(strings.ToUpper(oArray[0]), fmt.Sprintf("%s%s", ".", commonImageFormats[i])) {
 						foundExt += 1
 						break
@@ -2255,8 +3390,8 @@ func main() {
 			/*The output filename does not include a (common) file extension.*/
 			if foundExt != 0 {
 				foundExt = int8((1 << cifLength) - 1)
-				for i := 0; i < len(yArray)-2; i++ {
-					for j := 0; j < cifLength; j++ {
+				for i := range len(yArray) - 2 {
+					for j := range cifLength {
 						foundExt &= int8(^((1 - absInt(strings.Compare(strings.ToUpper(yArray[i][len(yArray[i])-len(commonImageFormats[j])-1:]), fmt.Sprint(".", commonImageFormats[j])))) << j))
 					}
 				}
@@ -2270,17 +3405,17 @@ func main() {
 						}
 						outputSuffix += fmt.Sprintf("%s%s", ".", commonImageFormats[extCursor])
 						/*The input filenames collectively include mutliple common extensions.*/
-					} else if int(k) < cifLength-1 {
+					} else if k < cifLength-1 {
 						fmt.Println("Multiple extensions found among input files. Defaulting to PNG for output.")
 						outputSuffix += ".png"
 					}
-					/*The input filenames do not collectively invlude any (common) file extensions.*/
+					/*The input filenames do not collectively include any (common) file extensions.*/
 				} else {
 					fmt.Println("No valid extensions found among input files.")
 					return
 				}
 			}
-			for i := 0; i < len(yArray)-2; i++ {
+			for i := range len(yArray) - 2 {
 				numStr := fmt.Sprintf("%d", i)
 				for len(numStr) < int(leadingZeroes) {
 					numStr = fmt.Sprintf("%s%s", "0", numStr)
@@ -2288,55 +3423,78 @@ func main() {
 				outputFileNames[i] = fmt.Sprintf("%s%s%s", outputPrefix, numStr, outputSuffix)
 			}
 		}
-		for i := 0; i < len(yArray)-2; i++ {
-			for j := 0; j < len(yArray)-2; j++ {
+		for i := range outputFileNames {
+			for j := range len(yArray) - 2 {
 				if strings.Compare(outputFileNames[i], yArray[j]) == 0 {
 					fmt.Println("Setting output file name to input file name not permitted.")
 					return
 				}
 			}
 		}
-		for i := 0; i < len(yArray)-2; i++ {
-			img, err := openImage(yArray[i])
-			if nil != err {
-				fmt.Println("Please specify valid filenames for every input image.")
-				log.Fatal(err)
-				return
-			}
-			imgBnd := img.Bounds()
-			w := imgBnd.Max.X
-			h := imgBnd.Max.Y
-			t := generateTree(0, uint32(w), 0, uint32(h), uint8(minIn), uint8(maxIn))
-			/*To make things simpler, all images are converted to monochrome and stored in an
-			array of 8-bit numbers. Color is restored in the resulting image.*/
-			mono := convertToGrayscale(img, w, h)
-			monoNew := make([][]uint8, w)
-			for i := 0; i < w; i++ {
-				monoNew[i] = make([]uint8, h)
-				for j := 0; j < h; j++ {
-					monoNew[i][j] = 0
-				}
-			}
 
-			fmt.Println("Performing luma trace on " + yArray[i])
-			start = time.Now().UnixNano()
-			startTemp := start
-			monoNew = lumaTrace(mono, monoNew, array, arrayLen, t)
-			end := time.Now().UnixNano()
-			printTime(end - startTemp)
+		var wg sync.WaitGroup
 
-			ymg := colorize(img, mono, monoNew, w, h)
-			fmt.Println("Outputting to " + outputFileNames[i])
-			outputF, err := os.Create(outputFileNames[i])
-			if nil != err {
-				log.Fatal(err)
-				return
+		start = time.Now().UnixNano()
+		for i := 0; i < len(yArray)-2; i += tNum {
+			for j := range tNum {
+				wg.Add(1)
+				go func(i, j int) {
+					defer wg.Done()
+					if i+j < len(yArray)-2 {
+						k := i + j
+						img, err := openImage(yArray[k])
+						if nil != err {
+							fmt.Println("Please specify valid filenames for every input image.")
+							log.Fatal(err)
+							return
+						}
+						imgBnd := img.Bounds()
+						w := imgBnd.Max.X
+						h := imgBnd.Max.Y
+						t := generateTree(0, uint64(w), 0, uint64(h), uint64(minIn), uint64(maxIn), rand.Uint64(), rand.Uint64())
+
+						fmt.Println("Performing luma trace on " + yArray[k])
+						grayImg := gocv.IMRead(yArray[k], gocv.IMReadGrayScale)
+
+						if grayImg.Empty() {
+							fmt.Println("Error loading image")
+							os.Exit(1)
+						}
+						defer grayImg.Close()
+
+						pix_data := grayImg.ToBytes()
+						pix_data_out := lumaTrace(w, h, pix_data, array, arrayLen, t, naphilArray)
+
+						matOut, err := gocv.NewMatFromBytes(h, w, gocv.MatTypeCV8U, pix_data_out)
+
+						fmt.Println("Outputting to " + outputFileNames[k])
+						gocv.IMWrite(outputFileNames[k], matOut)
+
+					}
+				}(i, j)
 			}
-			defer outputF.Close()
-			png.Encode(outputF, ymg)
+			wg.Wait()
 		}
+		end := time.Now().UnixNano()
+		printTime(end - start)
 	}
 	if len(kArray) == 1 {
-		writeToFile(array, arrayLen, kArray[0])
+		/*Sort based on range and max and then output*/
+		if len(yArray) < 3 {
+			i_ := 0
+			for i_ < arrayLen {
+				g := array[i_]
+				d := g.dimCornAvg
+				d &= 0x00FFFFFF00000000
+				maxL := g.maxLuma
+				d += (uint64(maxL-g.minLuma) << 24)
+				d += (uint64(maxL) << 16)
+				array[i_].dimCornAvg = d
+				i_++
+			}
+		}
+		parallelSort(array, tNum)
+		fmt.Printf("Writing to file\n")
+		writeToFile(array, arrayLen, kArray[0], naphilArray)
 	}
 }
